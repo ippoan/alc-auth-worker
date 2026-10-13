@@ -1,0 +1,26 @@
+# 行カバレッジ 100% の登録簿 (ippoan/rust-leave-worker の同名のファイルの形。Refs ohishi-exp/rust-leave-worker#1)。
+#
+#   bash scripts/fetch-migrations.sh
+#   AUTH_TEST_ADMIN_DATABASE_URL=... cargo llvm-cov --locked -p auth --text > cov-auth.txt
+#   bash scripts/check_coverage_100.sh --use-cache cov-auth.txt
+#
+# 計測するのは `cargo test -p auth` の全部 = 各 module の単体テスト (純粋関数) と tests/api_db.rs
+# (口から実 DB まで。接続先が無ければ失敗する)。
+# lib.rs は mod 宣言だけで実行行が無いので登録しない。
+# worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
+
+# 共有 secret の constant-time 比較
+[[files]]
+path = "crates/auth/src/secret.rs"
+
+# 入力の検証 (username・purpose・label・secret_hash・一覧の query)
+[[files]]
+path = "crates/auth/src/creds.rs"
+
+# SQL を流す 1 か所 (tests/api_db.rs が実 DB で通す)
+[[files]]
+path = "crates/auth/src/pg.rs"
+
+# 内部口 (404 (secret / 不在) / 400 / 409 / 201 / 200 / 500 まで。tests/api_db.rs が通す)
+[[files]]
+path = "crates/auth/src/internal.rs"
