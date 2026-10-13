@@ -1,4 +1,4 @@
-//! 機械用資格情報の内部口 4 本とログインの内部口 3 本を、口から実 DB (RLS が効く `alc_api_app`) まで通すテスト。
+//! 機械用資格情報の内部口 4 本とログインの内部口 8 本を、口から実 DB (RLS が効く `alc_api_app`) まで通すテスト。
 //! 接続先は `AUTH_TEST_ADMIN_DATABASE_URL` (未設定なら失敗する。tests/support/mod.rs)。
 
 mod support;
@@ -289,7 +289,7 @@ async fn deleting_tenant_cascades() {
     assert_eq!(list(&a, t).await, json!({"credentials": []}));
 }
 
-/// 共有 secret が無い・違う・worker 側で取れない ときは、7 口とも (と当たらない path も) 404 で本文は空。DB にも届かない
+/// 共有 secret が無い・違う・worker 側で取れない ときは、12 口とも (と当たらない path も) 404 で本文は空。DB にも届かない
 #[tokio::test]
 async fn wrong_secret_is_404_everywhere() {
     let a = app().await;
@@ -301,7 +301,11 @@ async fn wrong_secret_is_404_everywhere() {
     let revoke_body = serde_json::to_vec(&json!({ "tenant_id": t })).unwrap();
     let google_body = serde_json::to_vec(&google_body(&gsub(), "x@example.test")).unwrap();
     let refresh_body = serde_json::to_vec(&refresh_body(Uuid::new_v4())).unwrap();
-    let requests: [(&str, String, Option<Vec<u8>>); 8] = [
+    let line_id = line_user_id();
+    let lw = serde_json::to_vec(&lineworks_body(t, &line_id, "x@example.test")).unwrap();
+    let line = serde_json::to_vec(&line_body(t, &line_id)).unwrap();
+    let reg = serde_json::to_vec(&recipient_body(t, &line_id, "x")).unwrap();
+    let requests: [(&str, String, Option<Vec<u8>>); 13] = [
         ("POST", PATH.to_owned(), Some(create_body)),
         ("GET", format!("{PATH}?tenant_id={t}"), None),
         ("POST", format!("{PATH}/{u}/revoke"), Some(revoke_body)),
@@ -309,6 +313,15 @@ async fn wrong_secret_is_404_everywhere() {
         ("GET", format!("{SSO}?provider=lineworks&domain=x"), None),
         ("POST", GOOGLE.to_owned(), Some(google_body)),
         ("POST", REFRESH.to_owned(), Some(refresh_body)),
+        ("POST", LINEWORKS.to_owned(), Some(lw)),
+        ("POST", LINE.to_owned(), Some(line)),
+        (
+            "GET",
+            format!("{USER_BY_LINE}?line_user_id={line_id}"),
+            None,
+        ),
+        ("POST", REGISTER.to_owned(), Some(reg)),
+        ("GET", format!("{RECIPIENTS}?line_user_id={line_id}"), None),
         ("GET", "/internal/nothing".to_owned(), None),
     ];
     let no_secret = app_without_secret().await;
@@ -334,6 +347,7 @@ async fn wrong_secret_is_404_everywhere() {
     // 何も変わっていない
     assert_eq!(lookup(&a, &v).await.status, 404);
     assert_eq!(lookup(&a, &u).await.json()["revoked"], false);
+    assert_eq!(line_rows(&line_id).await, (0, 0));
 }
 
 /// DB の失敗は 500 internal_error で、ログは SQLSTATE / 種類の label だけ
@@ -356,12 +370,23 @@ async fn db_failure_is_500() {
         .await,
         google(&a, &u, "u@example.test").await,
         call(&a, "POST", REFRESH, Some(refresh_body(t))).await,
+        call(
+            &a,
+            "POST",
+            LINEWORKS,
+            Some(lineworks_body(t, &u, "u@example.test")),
+        )
+        .await,
+        call(&a, "POST", LINE, Some(line_body(t, &u))).await,
+        call(&a, "GET", &format!("{USER_BY_LINE}?line_user_id={u}"), None).await,
+        call(&a, "POST", REGISTER, Some(recipient_body(t, &u, "x"))).await,
+        call(&a, "GET", &format!("{RECIPIENTS}?line_user_id={u}"), None).await,
     ] {
         assert_eq!(got.status, 500);
         assert_eq!(got.json(), json!({"error": "internal_error"}));
     }
     let logs = a.logs.lock().unwrap().clone();
-    assert_eq!(logs.len(), 7, "{logs:?}");
+    assert_eq!(logs.len(), 12, "{logs:?}");
     let whats = [
         "create",
         "list",
@@ -370,6 +395,11 @@ async fn db_failure_is_500() {
         "sso-config",
         "upsert-google",
         "refresh-token",
+        "upsert-lineworks",
+        "upsert-line",
+        "users/by-line-id",
+        "recipients/register-line",
+        "recipients/by-line-id",
     ];
     for (log, what) in logs.iter().zip(whats) {
         assert!(log.starts_with(&format!("{what}: ")), "{log}");
@@ -754,6 +784,10 @@ async fn bad_login_input_is_400() {
         SSO.to_owned(),
         format!("{SSO}?provider=lineworks"),
         format!("{SSO}?domain=x"),
+        USER_BY_LINE.to_owned(),
+        format!("{USER_BY_LINE}?line=x"),
+        RECIPIENTS.to_owned(),
+        format!("{RECIPIENTS}?line=x"),
     ] {
         let got = call(&a, "GET", &uri, None).await;
         assert_eq!(got.status, 400, "{uri}");
@@ -769,6 +803,16 @@ async fn bad_login_input_is_400() {
             REFRESH,
             json!({"user_id": Uuid::new_v4(), "refresh_hash": "h", "expires_at": "tomorrow"}),
         ),
+        (
+            LINEWORKS,
+            json!({"tenant_id": Uuid::new_v4(), "lineworks_id": "x", "name": "n"}),
+        ),
+        (
+            LINE,
+            json!({"tenant_id": "x", "line_user_id": "x", "name": "n"}),
+        ),
+        (LINE, json!({"line_user_id": "x", "name": "n"})),
+        (REGISTER, json!({"tenant_id": Uuid::new_v4(), "name": "n"})),
     ];
     for (path, b) in bodies {
         let got = call(&a, "POST", path, Some(b.clone())).await;
@@ -778,4 +822,343 @@ async fn bad_login_input_is_400() {
     let got = call_raw(&a, "POST", REFRESH, Some(SECRET), Some(b"{".to_vec())).await;
     assert_eq!(got.status, 400);
     assert!(a.logs.lock().unwrap().is_empty());
+}
+
+// ---------- ログインの口 (LINE・LINE WORKS・LINE の受信者) ----------
+
+const LINEWORKS: &str = "/internal/auth/users/upsert-lineworks";
+const LINE: &str = "/internal/auth/users/upsert-line";
+const USER_BY_LINE: &str = "/internal/auth/users/by-line-id";
+const REGISTER: &str = "/internal/auth/recipients/register-line";
+const RECIPIENTS: &str = "/internal/auth/recipients/by-line-id";
+
+fn line_user_id() -> String {
+    format!("U{}", Uuid::new_v4().simple())
+}
+
+fn lineworks_body(t: Uuid, id: &str, email: &str) -> Value {
+    json!({ "tenant_id": t, "lineworks_id": id, "email": email, "name": "LW User" })
+}
+
+fn line_body(t: Uuid, id: &str) -> Value {
+    json!({ "tenant_id": t, "line_user_id": id, "name": "LINE User" })
+}
+
+fn recipient_body(t: Uuid, id: &str, name: &str) -> Value {
+    json!({ "tenant_id": t, "line_user_id": id, "name": name })
+}
+
+/// その LINE の user id の (users の行数, 受信者の行数) を superuser で数える
+async fn line_rows(id: &str) -> (i64, i64) {
+    (
+        su_count(&format!(
+            "SELECT count(*) FROM alc_api.users WHERE line_user_id = '{id}'"
+        ))
+        .await,
+        su_count(&format!(
+            "SELECT count(*) FROM alc_api.notify_recipients WHERE line_user_id = '{id}'"
+        ))
+        .await,
+    )
+}
+
+/// superuser で、その user の role を変える (既存の user の role を口が書き換えないことの確かめ)
+async fn set_role(user: &Value, role: &str) {
+    su_exec(&format!(
+        "UPDATE alc_api.users SET role = '{role}' WHERE id = '{}'",
+        user["id"].as_str().unwrap()
+    ))
+    .await;
+}
+
+/// refresh token を保存して 204 と、DB に入ったことを確かめる (ログインの最後の手。移植元の runtime_role_test と同じ組み合わせ)
+async fn assert_refresh_saved(a: &App, user: &Value) {
+    let id = user["id"].as_str().unwrap();
+    let got = call(a, "POST", REFRESH, Some(refresh_body(id.parse().unwrap()))).await;
+    assert_eq!(got.status, 204);
+    let saved = su_count(&format!(
+        "SELECT count(*) FROM alc_api.users WHERE id = '{id}' AND refresh_token_hash = '{REFRESH_HASH}'"
+    ))
+    .await;
+    assert_eq!(saved, 1);
+}
+
+/// LINE WORKS: 新規は body の会社に viewer で作る (返す形は user の 8 列 + slug)。既存 (id の一致) は、
+/// 会社・role・email・name を変えずに返す (別の会社の tenant_id が来ても)。refresh token はどちらの後にも保存できる
+#[tokio::test]
+async fn lineworks_new_is_viewer_then_existing_is_kept() {
+    let a = app().await;
+    let (t, other) = (tenant().await, tenant().await);
+    set_tenant(t, None, Some(&format!("slug-{t}"))).await;
+    let id = line_user_id();
+    let email = format!("lw@{}", domain());
+    let got = call(&a, "POST", LINEWORKS, Some(lineworks_body(t, &id, &email))).await;
+    assert_eq!(got.status, 200);
+    let created = got.json();
+    assert_eq!(
+        keys(&created),
+        [
+            "email",
+            "google_sub",
+            "id",
+            "line_user_id",
+            "lineworks_id",
+            "name",
+            "role",
+            "slug",
+            "tenant_id"
+        ]
+    );
+    assert_eq!(created["tenant_id"], json!(t));
+    assert_eq!(
+        created["role"], "viewer",
+        "LINE WORKS の新規は viewer (admin にしない)"
+    );
+    assert_eq!(created["lineworks_id"], json!(id));
+    assert_eq!(created["email"], json!(email));
+    assert_eq!(created["name"], "LW User");
+    assert_eq!(created["google_sub"], Value::Null);
+    assert_eq!(created["line_user_id"], Value::Null);
+    assert_eq!(created["slug"], json!(format!("slug-{t}")));
+    assert_refresh_saved(&a, &created).await;
+
+    set_role(&created, "admin").await;
+    let renamed = json!({ "tenant_id": other, "lineworks_id": id, "email": "o@other.example.test", "name": "Renamed" });
+    let got = call(&a, "POST", LINEWORKS, Some(renamed)).await;
+    assert_eq!(got.status, 200);
+    let again = got.json();
+    assert_eq!(again["id"], created["id"]);
+    assert_eq!(again["tenant_id"], json!(t));
+    assert_eq!(again["role"], "admin", "既存の user の role は変えない");
+    assert_eq!(again["email"], json!(email));
+    assert_eq!(again["name"], "LW User");
+    assert_refresh_saved(&a, &again).await;
+    let rows = su_count(&format!(
+        "SELECT count(*) FROM alc_api.users WHERE lineworks_id = '{id}'"
+    ))
+    .await;
+    assert_eq!(rows, 1);
+    assert!(a.logs.lock().unwrap().is_empty());
+}
+
+/// LINE: 新規は body の会社に viewer で作り、email には LINE の user id が入る (移植元と同じ)。
+/// 既存は会社・role・name を変えずに返す。by-line-id は同じ形で引け、無い id は 200 `null`
+#[tokio::test]
+async fn line_new_is_viewer_then_existing_is_kept() {
+    let a = app().await;
+    let (t, other) = (tenant().await, tenant().await);
+    let id = line_user_id();
+    let by_id = format!("{USER_BY_LINE}?line_user_id={id}");
+    let got = call(&a, "GET", &by_id, None).await;
+    assert_eq!(got.status, 200, "無いは 404 にしない");
+    assert_eq!(got.body, b"null");
+
+    let got = call(&a, "POST", LINE, Some(line_body(t, &id))).await;
+    assert_eq!(got.status, 200);
+    let created = got.json();
+    assert_eq!(created["tenant_id"], json!(t));
+    assert_eq!(
+        created["role"], "viewer",
+        "LINE の新規は viewer (admin にしない)"
+    );
+    assert_eq!(created["line_user_id"], json!(id));
+    assert_eq!(created["email"], json!(id));
+    assert_eq!(created["name"], "LINE User");
+    assert_eq!(created["google_sub"], Value::Null);
+    assert_eq!(created["lineworks_id"], Value::Null);
+    assert_eq!(created["slug"], Value::Null);
+    assert_refresh_saved(&a, &created).await;
+
+    set_role(&created, "payroll").await;
+    set_tenant(t, None, Some(&format!("slug-{t}"))).await;
+    let renamed = json!({ "tenant_id": other, "line_user_id": id, "name": "Renamed" });
+    let again = call(&a, "POST", LINE, Some(renamed)).await.json();
+    assert_eq!(again["id"], created["id"]);
+    assert_eq!(again["tenant_id"], json!(t));
+    assert_eq!(again["role"], "payroll", "既存の user の role は変えない");
+    assert_eq!(again["name"], "LINE User");
+    assert_eq!(again["slug"], json!(format!("slug-{t}")));
+    assert_refresh_saved(&a, &again).await;
+    assert_eq!(line_rows(&id).await, (1, 0));
+
+    let got = call(&a, "GET", &by_id, None).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json(), again, "by-line-id は upsert-line と同じ形");
+    assert!(a.logs.lock().unwrap().is_empty());
+}
+
+/// 本番 (STAGING_MODE 無効) では会社を作らない: 無い会社の tenant_id は FK 違反で 500 (移植元と同じ)、
+/// 会社も user も増えない。ログは SQLSTATE だけ
+#[tokio::test]
+async fn line_unknown_tenant_is_500_in_production() {
+    let a = app().await;
+    let t = Uuid::new_v4();
+    let (id, lw) = (line_user_id(), line_user_id());
+    let got = call(&a, "POST", LINE, Some(line_body(t, &id))).await;
+    assert_eq!(got.status, 500);
+    assert_eq!(got.json(), json!({"error": "internal_error"}));
+    let got = call(
+        &a,
+        "POST",
+        LINEWORKS,
+        Some(lineworks_body(t, &lw, "a@example.test")),
+    )
+    .await;
+    assert_eq!(got.status, 500);
+    let tenants = su_count(&format!(
+        "SELECT count(*) FROM alc_api.tenants WHERE id = '{t}'"
+    ))
+    .await;
+    assert_eq!(tenants, 0);
+    assert_eq!(line_rows(&id).await, (0, 0));
+    assert_eq!(
+        *a.logs.lock().unwrap(),
+        ["upsert-line: 23503", "upsert-lineworks: 23503"]
+    );
+}
+
+/// STAGING_MODE では、無い会社を先に在らせて (名前は移植元と同じ) その viewer を作る。在る会社は名前を変えない
+#[tokio::test]
+async fn line_unknown_tenant_is_ensured_in_staging() {
+    let a = app_staging().await;
+    let (missing, existing) = (Uuid::new_v4(), tenant().await);
+    for (path, t, b) in [
+        (LINE, missing, line_body(missing, &line_user_id())),
+        (
+            LINEWORKS,
+            missing,
+            lineworks_body(missing, &line_user_id(), "a@example.test"),
+        ),
+        (LINE, existing, line_body(existing, &line_user_id())),
+    ] {
+        let got = call(&a, "POST", path, Some(b)).await;
+        assert_eq!(got.status, 200, "{path}");
+        assert_eq!(got.json()["tenant_id"], json!(t));
+        assert_eq!(got.json()["role"], "viewer");
+    }
+    let made = su_count(&format!(
+        "SELECT count(*) FROM alc_api.tenants WHERE id = '{missing}' AND name = 'LINE WORKS (staging auto)'"
+    ))
+    .await;
+    assert_eq!(made, 1);
+    let kept = su_count(&format!(
+        "SELECT count(*) FROM alc_api.tenants WHERE id = '{existing}' AND name = 'auth-test-{existing}'"
+    ))
+    .await;
+    assert_eq!(kept, 1);
+    assert!(a.logs.lock().unwrap().is_empty());
+}
+
+/// 受信者: 登録は 204、同じ会社の重複も 204 で何もしない (名前も変えない)。逆引きは会社をまたいで全部返し、
+/// 無効な受信者・無い id は出さない
+#[tokio::test]
+async fn line_recipients_register_and_lookup() {
+    let a = app().await;
+    let (t1, t2) = (tenant().await, tenant().await);
+    let id = line_user_id();
+    for (t, name) in [(t1, "first"), (t1, "second"), (t2, "other")] {
+        let got = call(&a, "POST", REGISTER, Some(recipient_body(t, &id, name))).await;
+        assert_eq!(got.status, 204);
+        assert!(got.body.is_empty());
+    }
+    assert_eq!(line_rows(&id).await, (0, 2));
+    let got = call(&a, "GET", &format!("{RECIPIENTS}?line_user_id={id}"), None).await;
+    assert_eq!(got.status, 200);
+    let mut rows = got.json().as_array().unwrap().clone();
+    rows.sort_by_key(|r| r["tenant_id"].as_str().unwrap().to_owned());
+    let mut want = vec![
+        json!({"tenant_id": t1, "name": "first"}),
+        json!({"tenant_id": t2, "name": "other"}),
+    ];
+    want.sort_by_key(|r| r["tenant_id"].as_str().unwrap().to_owned());
+    assert_eq!(rows, want);
+
+    su_exec(&format!(
+        "UPDATE alc_api.notify_recipients SET enabled = false WHERE tenant_id = '{t2}' AND line_user_id = '{id}'"
+    ))
+    .await;
+    let got = call(&a, "GET", &format!("{RECIPIENTS}?line_user_id={id}"), None).await;
+    assert_eq!(got.json(), json!([{"tenant_id": t1, "name": "first"}]));
+    let got = call(
+        &a,
+        "GET",
+        &format!("{RECIPIENTS}?line_user_id={}", line_user_id()),
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json(), json!([]));
+    assert!(a.logs.lock().unwrap().is_empty());
+}
+
+/// RLS: 口の INSERT の文 (users・受信者) は、別の会社の transaction からは入らず (42501)、
+/// 別の会社の transaction からは入った行が見えない
+#[tokio::test]
+async fn line_inserts_are_bound_by_rls() {
+    use alc_worker_db::PgClient;
+    use auth::pg::login_sql;
+    use tokio_postgres::types::Type;
+
+    async fn run(
+        pg: &mut PgClient,
+        as_tenant: Uuid,
+        sql: &'static str,
+        t: Uuid,
+        id: String,
+    ) -> Result<u64, tokio_postgres::Error> {
+        pg.tenant_tx(as_tenant, move |tx| {
+            Box::pin(async move {
+                let name = "x".to_owned();
+                if sql == login_sql::INSERT_LINE_USER {
+                    tx.query_typed(
+                        sql,
+                        &[(&t, Type::UUID), (&id, Type::TEXT), (&name, Type::TEXT)],
+                    )
+                    .await
+                    .map(|r| r.len() as u64)
+                } else {
+                    tx.execute_typed(
+                        sql,
+                        &[(&t, Type::UUID), (&name, Type::TEXT), (&id, Type::TEXT)],
+                    )
+                    .await
+                }
+            })
+        })
+        .await
+    }
+
+    async fn visible(pg: &mut PgClient, as_tenant: Uuid, id: String) -> i64 {
+        pg.tenant_tx(as_tenant, move |tx| {
+            Box::pin(async move {
+                let row = tx
+                    .query_typed_one(
+                        "SELECT (SELECT count(*) FROM alc_api.users WHERE line_user_id = $1) \
+                         + (SELECT count(*) FROM alc_api.notify_recipients WHERE line_user_id = $1)",
+                        &[(&id, Type::TEXT)],
+                    )
+                    .await?;
+                Ok(row.get::<_, i64>(0))
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    let mut pg = support::app_client().await;
+    let (mine, other) = (tenant().await, tenant().await);
+    let id = line_user_id();
+    for sql in [
+        login_sql::INSERT_LINE_USER,
+        login_sql::REGISTER_LINE_RECIPIENT,
+    ] {
+        let e = run(&mut pg, other, sql, mine, id.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(alc_worker_db::kind(&e), "42501", "{sql}");
+        assert_eq!(run(&mut pg, mine, sql, mine, id.clone()).await.unwrap(), 1);
+    }
+    assert_eq!(line_rows(&id).await, (1, 1));
+    assert_eq!(visible(&mut pg, mine, id.clone()).await, 2);
+    assert_eq!(visible(&mut pg, other, id.clone()).await, 0);
 }
