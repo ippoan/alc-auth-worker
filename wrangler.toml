@@ -75,6 +75,12 @@ binding = "INTERNAL_SHARED_SECRET"
 store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
 secret_name = "INTERNAL_SHARED_SECRET"
 
+# Google の初回ログインで、招待も email_domain の一致も無いときに会社を作る (crates/auth の login)。
+# staging だけ (トップレベル・ほかの env には置かない。scripts/check-exposure.sh が検査する)。
+# DB が Hyperdrive の段 (本番) なのにこれが有効なら、worker は全部の口を 500 にする (src/lib.rs)
+[env.staging.vars]
+STAGING_MODE = "1"
+
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
 # binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ
 [env.local]

@@ -214,13 +214,14 @@ pub struct App {
     pub logs: Arc<StdMutex<Vec<String>>>,
 }
 
-fn build(pg: PgClient, secret: Option<&str>) -> App {
+fn build(pg: PgClient, secret: Option<&str>, staging_mode: bool) -> App {
     let logs = Arc::new(StdMutex::new(Vec::new()));
     let sink = logs.clone();
     let state = InternalState {
         pg: Arc::new(Mutex::new(pg)),
         secret: secret.map(Arc::from),
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
+        staging_mode,
     };
     App {
         router: internal_router(state),
@@ -228,14 +229,19 @@ fn build(pg: PgClient, secret: Option<&str>) -> App {
     }
 }
 
-/// 共有 secret が [`SECRET`] の口
+/// 共有 secret が [`SECRET`] の口 (本番と同じく STAGING_MODE は無効)
 pub async fn app() -> App {
-    build(app_client().await, Some(SECRET))
+    build(app_client().await, Some(SECRET), false)
+}
+
+/// STAGING_MODE が有効な口 (staging。Google の初回ログインで会社を作る)
+pub async fn app_staging() -> App {
+    build(app_client().await, Some(SECRET), true)
 }
 
 /// worker が Secrets Store から secret を取れなかったときの口 (全部 404 になるはず)
 pub async fn app_without_secret() -> App {
-    build(app_client().await, None)
+    build(app_client().await, None, false)
 }
 
 /// 接続が切れた口 (DB の失敗 = 500 の経路を通す)。superuser が backend を終わらせる
@@ -257,7 +263,7 @@ pub async fn broken_app() -> App {
         )
         .await
     );
-    build(pg, Some(SECRET))
+    build(pg, Some(SECRET), false)
 }
 
 pub struct Got {

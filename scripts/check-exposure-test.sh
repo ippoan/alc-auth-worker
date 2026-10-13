@@ -45,8 +45,14 @@ mutate "staging 以外の env がトップレベルの true を継承" \
   's = re.sub(r"^workers_dev = false$", "workers_dev = true", s, count=1, flags=re.M) + "\n[env.other]\nname = \"x\"\n"'
 mutate "トップレベルの vars に ALLOW_INSECURE_DB" \
   's = s.replace("[build]", "[vars]\nALLOW_INSECURE_DB = \"1\"\n\n[build]", 1)'
+# env.staging には既に [env.staging.vars] (STAGING_MODE) が在るので、表を足さずにその中へ行を足す
+# (表を二重に書くと TOML として読めずに落ち、検査の意味が無くなる)
 mutate "staging の vars に ALLOW_INSECURE_DB" \
-  's = s.replace("[env.staging.observability]", "[env.staging.vars]\nALLOW_INSECURE_DB = \"1\"\n\n[env.staging.observability]", 1)'
+  's = s.replace("STAGING_MODE = \"1\"\n", "STAGING_MODE = \"1\"\nALLOW_INSECURE_DB = \"1\"\n", 1)'
+mutate "トップレベルの vars に STAGING_MODE" \
+  's = s.replace("[build]", "[vars]\nSTAGING_MODE = \"1\"\n\n[build]", 1)'
+mutate "staging 以外の env (local) の vars に STAGING_MODE" \
+  's += "\n[env.local.vars]\nSTAGING_MODE = \"1\"\n"'
 mutate "トップレベルの workers_dev を true に" \
   's = re.sub(r"^workers_dev = false$", "workers_dev = true", s, count=1, flags=re.M)'
 mutate "トップレベルの preview_urls を消す" \
