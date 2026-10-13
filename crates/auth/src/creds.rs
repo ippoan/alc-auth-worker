@@ -29,6 +29,14 @@ pub struct RevokeInput {
     pub tenant_id: Uuid,
 }
 
+/// `POST /internal/machine-credentials/{username}/rotate` の body
+#[derive(Debug, Deserialize)]
+pub struct RotateInput {
+    pub tenant_id: Uuid,
+    /// 新しい password の sha256 の hex (計算は auth-worker 側)
+    pub secret_hash: String,
+}
+
 /// `GET /internal/machine-credentials` の query (形の検証は [`check_list`])
 #[derive(Debug, Default, Deserialize)]
 pub struct ListQuery {
@@ -90,6 +98,14 @@ pub fn check_create(input: &CreateInput) -> Result<(), &'static str> {
     if !valid_label(&input.label) {
         return Err("invalid_label");
     }
+    if !valid_secret_hash(&input.secret_hash) {
+        return Err("invalid_secret_hash");
+    }
+    Ok(())
+}
+
+/// rotate の body の検証 (tenant_id は型で UUID。secret_hash の形だけ)
+pub fn check_rotate(input: &RotateInput) -> Result<(), &'static str> {
     if !valid_secret_hash(&input.secret_hash) {
         return Err("invalid_secret_hash");
     }
@@ -178,6 +194,19 @@ mod tests {
             bad(|i| i.secret_hash = "x".into()),
             Err("invalid_secret_hash")
         );
+    }
+
+    #[test]
+    fn rotate_checks_the_hash() {
+        let r = |h: &str| {
+            check_rotate(&RotateInput {
+                tenant_id: Uuid::nil(),
+                secret_hash: h.into(),
+            })
+        };
+        assert_eq!(r(HASH), Ok(()));
+        assert_eq!(r("x"), Err("invalid_secret_hash"));
+        assert_eq!(r(&HASH.to_uppercase()), Err("invalid_secret_hash"));
     }
 
     #[test]

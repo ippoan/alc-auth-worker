@@ -27,6 +27,10 @@ pub mod sql {
     pub const REVOKE: &str = "UPDATE alc_api.machine_credentials \
          SET revoked_at = COALESCE(revoked_at, NOW()) WHERE username = $1 AND tenant_id = $2";
 
+    /// 失効していない行だけ hash を差し替える (0 行 = 失効済み・無い・他社)
+    pub const ROTATE: &str = "UPDATE alc_api.machine_credentials SET secret_hash = $3 \
+         WHERE username = $1 AND tenant_id = $2 AND revoked_at IS NULL";
+
     /// 会社をまたぐ照合 (SECURITY DEFINER の関数。ippoan/alc-migrations の 173)
     pub const LOOKUP: &str = "SELECT tenant_id, purpose, secret_hash, revoked \
          FROM alc_api.machine_credential_lookup($1)";
@@ -91,6 +95,31 @@ pub async fn revoke(pg: &mut PgClient, tenant_id: Uuid, username: String) -> Res
                 .execute_typed(
                     sql::REVOKE,
                     &[(&username, Type::TEXT), (&tenant_id, Type::UUID)],
+                )
+                .await?;
+            Ok(n > 0)
+        })
+    })
+    .await
+}
+
+/// secret_hash を差し替える。失効済み・無い・他社なら false
+pub async fn rotate(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    username: String,
+    secret_hash: String,
+) -> Result<bool, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let n = tx
+                .execute_typed(
+                    sql::ROTATE,
+                    &[
+                        (&username, Type::TEXT),
+                        (&tenant_id, Type::UUID),
+                        (&secret_hash, Type::TEXT),
+                    ],
                 )
                 .await?;
             Ok(n > 0)

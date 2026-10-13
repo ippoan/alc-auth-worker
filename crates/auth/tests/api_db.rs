@@ -1,4 +1,4 @@
-//! 機械用資格情報の内部口 4 本とログインの内部口 8 本を、口から実 DB (RLS が効く `alc_api_app`) まで通すテスト。
+//! 機械用資格情報の内部口 5 本とログインの内部口 8 本を、口から実 DB (RLS が効く `alc_api_app`) まで通すテスト。
 //! 接続先は `AUTH_TEST_ADMIN_DATABASE_URL` (未設定なら失敗する。tests/support/mod.rs)。
 
 mod support;
@@ -43,6 +43,18 @@ async fn revoke(a: &App, username: &str, tenant_id: Uuid) -> support::Got {
         "POST",
         &format!("{PATH}/{username}/revoke"),
         Some(json!({ "tenant_id": tenant_id })),
+    )
+    .await
+}
+
+const NEW_HASH: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+async fn rotate(a: &App, username: &str, tenant_id: Uuid, hash: &str) -> support::Got {
+    call(
+        a,
+        "POST",
+        &format!("{PATH}/{username}/rotate"),
+        Some(json!({ "tenant_id": tenant_id, "secret_hash": hash })),
     )
     .await
 }
@@ -222,6 +234,68 @@ async fn bad_list_query_is_400() {
     }
 }
 
+/// rotate: hash だけ新しくなり (username・purpose・会社はそのまま)、2 回目も通る
+#[tokio::test]
+async fn rotate_replaces_the_hash() {
+    let a = app().await;
+    let t = tenant().await;
+    let u = username();
+    assert_eq!(create(&a, &u, t, "x").await.status, 201);
+    let got = rotate(&a, &u, t, NEW_HASH).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json(), json!({"rotated": true}));
+    assert_eq!(
+        lookup(&a, &u).await.json(),
+        json!({"tenant_id": t, "purpose": "leave-scan", "secret_hash": NEW_HASH, "revoked": false})
+    );
+    assert_eq!(rotate(&a, &u, t, HASH).await.status, 200);
+    assert_eq!(lookup(&a, &u).await.json()["secret_hash"], HASH);
+}
+
+/// rotate の失敗: 失効済み・他社・無い・形の違う username は 404 (hash は変わらない)、body の不正は 400
+#[tokio::test]
+async fn rotate_errors() {
+    let a = app().await;
+    let (t, other) = (tenant().await, tenant().await);
+    let (u, dead) = (username(), username());
+    assert_eq!(create(&a, &u, t, "x").await.status, 201);
+    assert_eq!(create(&a, &dead, t, "x").await.status, 201);
+    assert_eq!(revoke(&a, &dead, t).await.status, 200);
+    for (name, tenant_id) in [
+        (dead.clone(), t),
+        (u.clone(), other),
+        (username(), t),
+        ("mc_XYZ".to_owned(), t),
+    ] {
+        let got = rotate(&a, &name, tenant_id, NEW_HASH).await;
+        assert_eq!(got.status, 404, "{name}");
+        assert_eq!(got.json(), json!({"error": "not_found"}));
+    }
+    assert_eq!(lookup(&a, &u).await.json()["secret_hash"], HASH);
+    assert_eq!(lookup(&a, &dead).await.json()["secret_hash"], HASH);
+    let uri = format!("{PATH}/{u}/rotate");
+    for (b, code) in [
+        (
+            json!({"tenant_id": t, "secret_hash": "x"}),
+            "invalid_secret_hash",
+        ),
+        (
+            json!({"tenant_id": t, "secret_hash": NEW_HASH.to_uppercase()}),
+            "invalid_secret_hash",
+        ),
+        (
+            json!({"tenant_id": "x", "secret_hash": NEW_HASH}),
+            "invalid_body",
+        ),
+        (json!({"tenant_id": t}), "invalid_body"),
+    ] {
+        let got = call(&a, "POST", &uri, Some(b)).await;
+        assert_eq!(got.status, 400);
+        assert_eq!(got.json(), json!({ "error": code }));
+    }
+    assert_eq!(lookup(&a, &u).await.json()["secret_hash"], HASH);
+}
+
 /// 失効の body の不正は 400、形の違う username・無い username は 404
 #[tokio::test]
 async fn revoke_errors() {
@@ -289,7 +363,7 @@ async fn deleting_tenant_cascades() {
     assert_eq!(list(&a, t).await, json!({"credentials": []}));
 }
 
-/// 共有 secret が無い・違う・worker 側で取れない ときは、12 口とも (と当たらない path も) 404 で本文は空。DB にも届かない
+/// 共有 secret が無い・違う・worker 側で取れない ときは、13 口とも (と当たらない path も) 404 で本文は空。DB にも届かない
 #[tokio::test]
 async fn wrong_secret_is_404_everywhere() {
     let a = app().await;
@@ -299,16 +373,19 @@ async fn wrong_secret_is_404_everywhere() {
     let v = username();
     let create_body = serde_json::to_vec(&body(&v, t, "x")).unwrap();
     let revoke_body = serde_json::to_vec(&json!({ "tenant_id": t })).unwrap();
+    let rotate_body =
+        serde_json::to_vec(&json!({ "tenant_id": t, "secret_hash": NEW_HASH })).unwrap();
     let google_body = serde_json::to_vec(&google_body(&gsub(), "x@example.test")).unwrap();
     let refresh_body = serde_json::to_vec(&refresh_body(Uuid::new_v4())).unwrap();
     let line_id = line_user_id();
     let lw = serde_json::to_vec(&lineworks_body(t, &line_id, "x@example.test")).unwrap();
     let line = serde_json::to_vec(&line_body(t, &line_id)).unwrap();
     let reg = serde_json::to_vec(&recipient_body(t, &line_id, "x")).unwrap();
-    let requests: [(&str, String, Option<Vec<u8>>); 13] = [
+    let requests: [(&str, String, Option<Vec<u8>>); 14] = [
         ("POST", PATH.to_owned(), Some(create_body)),
         ("GET", format!("{PATH}?tenant_id={t}"), None),
         ("POST", format!("{PATH}/{u}/revoke"), Some(revoke_body)),
+        ("POST", format!("{PATH}/{u}/rotate"), Some(rotate_body)),
         ("GET", format!("{PATH}/{u}"), None),
         ("GET", format!("{SSO}?provider=lineworks&domain=x"), None),
         ("POST", GOOGLE.to_owned(), Some(google_body)),
@@ -360,6 +437,7 @@ async fn db_failure_is_500() {
         create(&a, &u, t, "x").await,
         call(&a, "GET", &format!("{PATH}?tenant_id={t}"), None).await,
         revoke(&a, &u, t).await,
+        rotate(&a, &u, t, NEW_HASH).await,
         lookup(&a, &u).await,
         call(
             &a,
@@ -386,11 +464,12 @@ async fn db_failure_is_500() {
         assert_eq!(got.json(), json!({"error": "internal_error"}));
     }
     let logs = a.logs.lock().unwrap().clone();
-    assert_eq!(logs.len(), 12, "{logs:?}");
+    assert_eq!(logs.len(), 13, "{logs:?}");
     let whats = [
         "create",
         "list",
         "revoke",
+        "rotate",
         "lookup",
         "sso-config",
         "upsert-google",
