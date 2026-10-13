@@ -5,6 +5,7 @@
 //! | POST | `/internal/machine-credentials` | 201 `{}` / 400 / 409 (username の重複) / 404 `tenant_not_found` |
 //! | GET | `/internal/machine-credentials?tenant_id=…[&purpose=…]` | 200 `{credentials:[…]}` (作った順。hash は返さない) / 400 |
 //! | POST | `/internal/machine-credentials/{username}/revoke` | 200 `{revoked:true}` / 400 / 404 (その会社に無い) |
+//! | POST | `/internal/machine-credentials/{username}/rotate` | 200 `{rotated:true}` (secret_hash を差し替える。旧 password は即失効) / 400 / 404 (失効済み・無い・他社) |
 //! | GET | `/internal/machine-credentials/{username}` | 200 `{tenant_id,purpose,secret_hash,revoked}` / 404 (会社をまたいで照合) |
 //!
 //! ログインの口 (`/internal/auth/…`) は [`crate::login`] に在り、同じ router に載せて同じ layer で守る。
@@ -32,7 +33,10 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio_postgres::error::SqlState;
 
-use crate::creds::{check_create, check_list, valid_username, CreateInput, ListQuery, RevokeInput};
+use crate::creds::{
+    check_create, check_list, check_rotate, valid_username, CreateInput, ListQuery, RevokeInput,
+    RotateInput,
+};
 use crate::login::login_routes;
 use crate::pg;
 use crate::secret::secret_matches;
@@ -40,6 +44,7 @@ use crate::secret::secret_matches;
 pub const CREDENTIALS_PATH: &str = "/internal/machine-credentials";
 const ONE_PATH: &str = "/internal/machine-credentials/{username}";
 const REVOKE_PATH: &str = "/internal/machine-credentials/{username}/revoke";
+const ROTATE_PATH: &str = "/internal/machine-credentials/{username}/rotate";
 /// 共有 secret を載せるヘッダー (ippoan/rust-leave-worker の `/internal/ingest` と同じ名前)
 pub const SECRET_HEADER: &str = "X-Internal-Shared-Secret";
 /// body の大きさの上限 (入力は短い文字列 5 つまで)
@@ -63,6 +68,7 @@ pub fn internal_router(state: InternalState) -> Router {
         .route(CREDENTIALS_PATH, post(create).get(list))
         .route(ONE_PATH, get(lookup))
         .route(REVOKE_PATH, post(revoke))
+        .route(ROTATE_PATH, post(rotate))
         .merge(login_routes())
         // `layer` は当たらない path (fallback) にも掛かる: secret が無ければ口の有無も分からない
         .layer(middleware::from_fn_with_state(
@@ -158,6 +164,38 @@ async fn revoke(
         Ok(true) => Json(json!({ "revoked": true })).into_response(),
         Ok(false) => not_found(),
         Err(e) => db_error(&state, "revoke", &e),
+    }
+}
+
+/// secret_hash を差し替える (username はそのまま。旧 password は即失効)。失効済み・無い・他社は 404。
+/// rotate 前に発行済みの inbox のチケット (TTL 7 日) は username が有効かだけを見るので rotate 後も通る
+/// (過去の PUT への印なので仕様)。
+async fn rotate(
+    State(state): State<InternalState>,
+    Path(username): Path<String>,
+    body: Body,
+) -> Response {
+    let input: RotateInput = match read_json(body).await {
+        Ok(i) => i,
+        Err(r) => return r,
+    };
+    if let Err(code) = check_rotate(&input) {
+        return error(StatusCode::BAD_REQUEST, code);
+    }
+    if !valid_username(&username) {
+        return not_found();
+    }
+    match pg::rotate(
+        &mut *state.pg.lock().await,
+        input.tenant_id,
+        username,
+        input.secret_hash,
+    )
+    .await
+    {
+        Ok(true) => Json(json!({ "rotated": true })).into_response(),
+        Ok(false) => not_found(),
+        Err(e) => db_error(&state, "rotate", &e),
     }
 }
 

@@ -15,7 +15,7 @@ worker-build --release && npx wrangler@4.144.0 deploy --dry-run
 DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip しない)。
 
 ## 規範
-- 口は `/internal/machine-credentials…` の 4 本 (`crates/auth/src/internal.rs`) と、ログインの `/internal/auth/…` の 8 本
+- 口は `/internal/machine-credentials…` の 5 本 (`crates/auth/src/internal.rs`) と、ログインの `/internal/auth/…` の 8 本
   (sso-config・users/upsert-google・refresh-token・users/upsert-lineworks・users/upsert-line・users/by-line-id・
   recipients/register-line・recipients/by-line-id。`crates/auth/src/login.rs`。返す JSON の形は移植元 rust-alc-api と同じ。
   users/by-line-id の無しは 200 `null`)。
@@ -42,6 +42,6 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/auth/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止 (tests/ の superuser の側も `batch_execute` と `query_typed` だけ)。
 - 応答・ログには固定の語だけ (username・email・hash・secret・生のエラー文を出さない)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 8・api_db 30) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 9・api_db 32) はテストを足したら上げる。
 - public repo: ホスト名・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (ippoan/rust-leave-worker と同じ rev)。
