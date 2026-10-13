@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::types::Type;
+use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Error, Row};
 use uuid::Uuid;
 
@@ -119,11 +119,11 @@ pub async fn lookup(pg: &mut PgClient, username: String) -> Result<Option<Lookup
     .await
 }
 
-// ---------- ログイン (Google・refresh token・SSO 設定) の部品。LINE 系の口 (後続) も使う ----------
+// ---------- ログイン (Google・LINE・LINE WORKS・refresh token・SSO 設定・LINE の受信者) の部品 ----------
 //
-// 会社が決まる前の照会 (users / 招待の逆引き・SSO 設定・refresh token の保存) は、上の `lookup` と同じく
+// 会社が決まる前の照会 (users / 招待 / 受信者の逆引き・SSO 設定・refresh token の保存) は、上の `lookup` と同じく
 // nil の tenant の transaction で SECURITY DEFINER の関数だけを呼ぶ。tenants は RLS の無い表で、email_domain での
-// 照会と staging の会社の作成も nil の transaction で流す。users の INSERT・招待の DELETE・slug の取得は、
+// 照会と staging の会社の作成も nil の transaction で流す。users・受信者の INSERT・招待の DELETE・slug の取得は、
 // その会社の transaction で tenant_id を VALUES / WHERE に明示する。
 
 /// users の行のうち口が返す 8 列 (hash・refresh token の列は読まない)。順は [`user`] の map と同じ
@@ -139,6 +139,20 @@ pub mod login_sql {
         "SELECT ",
         user_columns!(),
         " FROM alc_api.find_user_by_google_sub($1)"
+    );
+
+    /// LINE WORKS の id で users を逆引き (SECURITY DEFINER。158)
+    pub const USER_BY_LINEWORKS_ID: &str = concat!(
+        "SELECT ",
+        user_columns!(),
+        " FROM alc_api.find_user_by_lineworks_id($1)"
+    );
+
+    /// LINE の user id で users を逆引き (SECURITY DEFINER。121)
+    pub const USER_BY_LINE_USER_ID: &str = concat!(
+        "SELECT ",
+        user_columns!(),
+        " FROM alc_api.find_user_by_line_user_id($1)"
     );
 
     /// 招待を email で逆引き (SECURITY DEFINER。158。email は一意)
@@ -157,6 +171,11 @@ pub mod login_sql {
     pub const INSERT_TENANT: &str =
         "INSERT INTO alc_api.tenants (name, email_domain) VALUES ($1, $1) RETURNING id";
 
+    /// 会社を id で在らせる (staging の LINE・LINE WORKS だけ。名前は移植元と同じ。在れば何もしない)。
+    /// short_id は DEFAULT の乱数で、UNIQUE 違反なら呼び手が流し直す
+    pub const ENSURE_TENANT: &str = "INSERT INTO alc_api.tenants (id, name) \
+         VALUES ($1, 'LINE WORKS (staging auto)') ON CONFLICT (id) DO NOTHING";
+
     pub const TENANT_SLUG: &str = "SELECT slug FROM alc_api.tenants WHERE id = $1";
 
     pub const INSERT_GOOGLE_USER: &str = concat!(
@@ -164,6 +183,30 @@ pub mod login_sql {
          VALUES ($1, $2, $3, $4, $5) RETURNING ",
         user_columns!()
     );
+
+    /// LINE WORKS の新規は role を viewer に固定する (昇格は招待 / 権限変更の画面から。移植元と同じ)
+    pub const INSERT_LINEWORKS_USER: &str = concat!(
+        "INSERT INTO alc_api.users (tenant_id, lineworks_id, email, name, role) \
+         VALUES ($1, $2, $3, $4, 'viewer') RETURNING ",
+        user_columns!()
+    );
+
+    /// LINE の新規も viewer 固定。email は無いので LINE の user id を入れる (移植元と同じ)
+    pub const INSERT_LINE_USER: &str = concat!(
+        "INSERT INTO alc_api.users (tenant_id, line_user_id, email, name, role) \
+         VALUES ($1, $2, $2, $3, 'viewer') RETURNING ",
+        user_columns!()
+    );
+
+    /// LINE の受信者を登録する (同じ会社の同じ LINE の user id は何もしない)
+    pub const REGISTER_LINE_RECIPIENT: &str =
+        "INSERT INTO alc_api.notify_recipients (tenant_id, name, provider, line_user_id) \
+         VALUES ($1, $2, 'line', $3) \
+         ON CONFLICT (tenant_id, line_user_id) WHERE line_user_id IS NOT NULL DO NOTHING";
+
+    /// LINE の user id で有効な受信者を会社をまたいで逆引き (SECURITY DEFINER。081。複数の会社に居れば全部)
+    pub const RECIPIENTS_BY_LINE_USER_ID: &str =
+        "SELECT tenant_id, recipient_name FROM alc_api.find_recipient_by_line_user_id($1)";
 
     /// refresh token の hash と期限を保存する (SECURITY DEFINER。158。引数は (user_id, hash, expires_at))
     pub const SAVE_REFRESH_TOKEN: &str = "SELECT alc_api.save_user_refresh_token($1, $2, $3)";
@@ -205,7 +248,15 @@ pub struct SsoConfig {
     pub woff_id: Option<String>,
 }
 
+/// LINE の受信者の逆引きの 1 行 (rust-alc-api の `RecipientTenant` と同じ形)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RecipientTenant {
+    pub tenant_id: Uuid,
+    pub name: String,
+}
+
 impl TxOutput for User {}
+impl TxOutput for RecipientTenant {}
 impl TxOutput for Invitation {}
 impl TxOutput for SsoConfig {}
 
@@ -223,15 +274,15 @@ pub fn user(r: &Row) -> User {
     }
 }
 
-pub async fn find_user_by_google_sub(
+/// 会社をまたいで users を 1 つの鍵で逆引きする。`sql` は `login_sql::USER_BY_*` (SECURITY DEFINER の関数)
+pub async fn find_user_by(
     pg: &mut PgClient,
-    google_sub: String,
+    sql: &'static str,
+    key: String,
 ) -> Result<Option<User>, Error> {
     pg.tenant_tx(Uuid::nil(), move |tx| {
         Box::pin(async move {
-            let row = tx
-                .query_typed_opt(login_sql::USER_BY_GOOGLE_SUB, &[(&google_sub, Type::TEXT)])
-                .await?;
+            let row = tx.query_typed_opt(sql, &[(&key, Type::TEXT)]).await?;
             Ok(row.as_ref().map(user))
         })
     })
@@ -327,6 +378,19 @@ pub async fn create_tenant_with_domain(
     .await
 }
 
+/// 会社を id で在らせる (staging だけが呼ぶ)。short_id の衝突は [`TENANT_INSERT_ATTEMPTS`] 回まで流し直す
+pub async fn ensure_tenant(pg: &mut PgClient, tenant_id: Uuid) -> Result<u64, Error> {
+    retry_on_unique(pg, TENANT_INSERT_ATTEMPTS, |pg| {
+        Box::pin(pg.tenant_tx(Uuid::nil(), move |tx| {
+            Box::pin(async move {
+                tx.execute_typed(login_sql::ENSURE_TENANT, &[(&tenant_id, Type::UUID)])
+                    .await
+            })
+        }))
+    })
+    .await
+}
+
 /// 会社の slug (未設定・会社が無いは `None`)
 pub async fn tenant_slug(pg: &mut PgClient, tenant_id: Uuid) -> Result<Option<String>, Error> {
     pg.tenant_tx(tenant_id, move |tx| {
@@ -340,30 +404,67 @@ pub async fn tenant_slug(pg: &mut PgClient, tenant_id: Uuid) -> Result<Option<St
     .await
 }
 
-/// Google のログインで users の行を作る (その会社の transaction で)
-pub async fn insert_google_user(
+/// ログインで users の行を作る (その会社の transaction で)。`sql` は `login_sql::INSERT_*_USER` で、
+/// `$1` が会社、`$2` 以降が `texts` (どれも TEXT) の順
+pub async fn insert_user(
     pg: &mut PgClient,
     tenant_id: Uuid,
-    google_sub: String,
-    email: String,
-    name: String,
-    role: String,
+    sql: &'static str,
+    texts: Vec<String>,
 ) -> Result<User, Error> {
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
-            let row = tx
-                .query_typed_one(
-                    login_sql::INSERT_GOOGLE_USER,
-                    &[
-                        (&tenant_id, Type::UUID),
-                        (&google_sub, Type::TEXT),
-                        (&email, Type::TEXT),
-                        (&name, Type::TEXT),
-                        (&role, Type::TEXT),
-                    ],
+            let mut params: Vec<(&(dyn ToSql + Sync), Type)> = vec![(&tenant_id, Type::UUID)];
+            params.extend(texts.iter().map(|t| (t as &(dyn ToSql + Sync), Type::TEXT)));
+            let row = tx.query_typed_one(sql, &params).await?;
+            Ok(user(&row))
+        })
+    })
+    .await
+}
+
+/// LINE の受信者を登録する (その会社の transaction で)。入った行数 (重複は 0)
+pub async fn register_line_recipient(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    name: String,
+    line_user_id: String,
+) -> Result<u64, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                login_sql::REGISTER_LINE_RECIPIENT,
+                &[
+                    (&tenant_id, Type::UUID),
+                    (&name, Type::TEXT),
+                    (&line_user_id, Type::TEXT),
+                ],
+            )
+            .await
+        })
+    })
+    .await
+}
+
+pub async fn find_recipients_by_line_user_id(
+    pg: &mut PgClient,
+    line_user_id: String,
+) -> Result<Vec<RecipientTenant>, Error> {
+    pg.tenant_tx(Uuid::nil(), move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(
+                    login_sql::RECIPIENTS_BY_LINE_USER_ID,
+                    &[(&line_user_id, Type::TEXT)],
                 )
                 .await?;
-            Ok(user(&row))
+            Ok(rows
+                .iter()
+                .map(|r| RecipientTenant {
+                    tenant_id: r.get(0),
+                    name: r.get(1),
+                })
+                .collect())
         })
     })
     .await

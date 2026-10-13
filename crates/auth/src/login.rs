@@ -6,12 +6,19 @@
 //! | GET | `/internal/auth/sso-config?provider=…&domain=…` | 200 SSO 設定 / 404 `sso_config_not_found` / 400 |
 //! | POST | `/internal/auth/users/upsert-google` | 200 user (8 列) + `slug` / 403 `no_tenant_for_email` / 400 |
 //! | POST | `/internal/auth/refresh-token` | 204 / 400 |
+//! | POST | `/internal/auth/users/upsert-lineworks` | 200 user (8 列) + `slug` / 400 |
+//! | POST | `/internal/auth/users/upsert-line` | 200 user (8 列) + `slug` / 400 |
+//! | GET | `/internal/auth/users/by-line-id?line_user_id=…` | 200 user (8 列) + `slug` / 200 `null` (無い) / 400 |
+//! | POST | `/internal/auth/recipients/register-line` | 204 (重複も) / 400 |
+//! | GET | `/internal/auth/recipients/by-line-id?line_user_id=…` | 200 `[{tenant_id,name}]` (会社をまたいで全部) / 400 |
 //!
 //! 共有 secret の照合は [`crate::internal`] の layer がこの口にも掛ける (一致しなければ本文の空の 404)。
 //! Google の ID token の検証は auth-worker 側 (ここは検証済みの sub / email / name を受け取るだけ)。
 //!
 //! Google の初回ログインの会社は、招待 (email の完全一致) → email_domain の一致 → **STAGING_MODE のときだけ**
 //! 会社を作る → それ以外は 403 の順に決める。role は招待の role、ほかは admin。
+//! LINE・LINE WORKS の会社は body の `tenant_id` で、新規の role は **viewer 固定**。**STAGING_MODE のときだけ**
+//! 先にその会社を在らせる (staging の DB は揮発し、SSO 設定の会社が消えていることがある)。
 //! 応答・ログは固定の語だけ (email・hash を出さない)。
 
 use axum::extract::rejection::QueryRejection;
@@ -27,11 +34,16 @@ use uuid::Uuid;
 use alc_worker_db::PgClient;
 
 use crate::internal::{db_error, error, read_json, InternalState};
-use crate::pg::{self, SsoConfig, User};
+use crate::pg::{self, login_sql, RecipientTenant, SsoConfig, User};
 
 pub const SSO_CONFIG_PATH: &str = "/internal/auth/sso-config";
 pub const UPSERT_GOOGLE_PATH: &str = "/internal/auth/users/upsert-google";
 pub const REFRESH_TOKEN_PATH: &str = "/internal/auth/refresh-token";
+pub const UPSERT_LINEWORKS_PATH: &str = "/internal/auth/users/upsert-lineworks";
+pub const UPSERT_LINE_PATH: &str = "/internal/auth/users/upsert-line";
+pub const USER_BY_LINE_ID_PATH: &str = "/internal/auth/users/by-line-id";
+pub const REGISTER_LINE_RECIPIENT_PATH: &str = "/internal/auth/recipients/register-line";
+pub const RECIPIENTS_BY_LINE_ID_PATH: &str = "/internal/auth/recipients/by-line-id";
 
 /// 招待が無く email_domain で会社が決まったときの role
 const DOMAIN_ROLE: &str = "admin";
@@ -68,6 +80,33 @@ struct UpsertGoogleBody {
 }
 
 #[derive(Debug, Deserialize)]
+struct UpsertLineworksBody {
+    tenant_id: Uuid,
+    lineworks_id: String,
+    email: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpsertLineBody {
+    tenant_id: Uuid,
+    line_user_id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ByLineIdQuery {
+    line_user_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterLineRecipientBody {
+    tenant_id: Uuid,
+    name: String,
+    line_user_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct RefreshTokenBody {
     user_id: Uuid,
     /// hex(sha256(raw)) — auth-worker 側で作った hash (raw は載せない)
@@ -80,6 +119,11 @@ pub fn login_routes() -> Router<InternalState> {
         .route(SSO_CONFIG_PATH, get(sso_config))
         .route(UPSERT_GOOGLE_PATH, post(upsert_google))
         .route(REFRESH_TOKEN_PATH, post(refresh_token))
+        .route(UPSERT_LINEWORKS_PATH, post(upsert_lineworks))
+        .route(UPSERT_LINE_PATH, post(upsert_line))
+        .route(USER_BY_LINE_ID_PATH, get(user_by_line_id))
+        .route(REGISTER_LINE_RECIPIENT_PATH, post(register_line_recipient))
+        .route(RECIPIENTS_BY_LINE_ID_PATH, get(recipients_by_line_id))
 }
 
 async fn sso_config(
@@ -117,7 +161,9 @@ async fn upsert_google_user(
     pg: &mut PgClient,
     b: UpsertGoogleBody,
 ) -> Result<Option<UserWithSlug>, tokio_postgres::Error> {
-    let user = match pg::find_user_by_google_sub(pg, b.google_sub.clone()).await? {
+    let user = match pg::find_user_by(pg, login_sql::USER_BY_GOOGLE_SUB, b.google_sub.clone())
+        .await?
+    {
         Some(u) => u,
         None => {
             // 移植元と同じ: '@' の後ろ (無ければ "default")
@@ -135,8 +181,13 @@ async fn upsert_google_user(
                     None => return Ok(None),
                 },
             };
-            let user =
-                pg::insert_google_user(pg, tenant_id, b.google_sub, b.email, b.name, role).await?;
+            let user = pg::insert_user(
+                pg,
+                tenant_id,
+                login_sql::INSERT_GOOGLE_USER,
+                vec![b.google_sub, b.email, b.name, role],
+            )
+            .await?;
             // 招待を使い済みにする。失敗は握りつぶす (login は通す。移植元と同じ)
             if let Some(inv) = invitation {
                 let _ = pg::delete_invitation(pg, inv).await;
@@ -144,8 +195,126 @@ async fn upsert_google_user(
             user
         }
     };
+    with_slug(pg, user).await.map(Some)
+}
+
+async fn with_slug(pg: &mut PgClient, user: User) -> Result<UserWithSlug, tokio_postgres::Error> {
     let slug = pg::tenant_slug(pg, user.tenant_id).await?;
-    Ok(Some(UserWithSlug { user, slug }))
+    Ok(UserWithSlug { user, slug })
+}
+
+/// LINE・LINE WORKS の 1 つの id で既存の user を引き、無ければ body の会社に viewer で作る (STAGING_MODE なら先に
+/// 会社を在らせる)。`texts[0]` が逆引きの鍵 (id)。既存の user は会社も role も変えずに返す
+async fn upsert_by_id(
+    state: &InternalState,
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    find_sql: &'static str,
+    insert_sql: &'static str,
+    texts: Vec<String>,
+) -> Result<UserWithSlug, tokio_postgres::Error> {
+    if state.staging_mode {
+        pg::ensure_tenant(pg, tenant_id).await?;
+    }
+    let user = match pg::find_user_by(pg, find_sql, texts[0].clone()).await? {
+        Some(u) => u,
+        None => pg::insert_user(pg, tenant_id, insert_sql, texts).await?,
+    };
+    with_slug(pg, user).await
+}
+
+async fn upsert_lineworks(State(state): State<InternalState>, body: axum::body::Body) -> Response {
+    let b: UpsertLineworksBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let texts = vec![b.lineworks_id, b.email, b.name];
+    match upsert_by_id(
+        &state,
+        &mut *state.pg.lock().await,
+        b.tenant_id,
+        login_sql::USER_BY_LINEWORKS_ID,
+        login_sql::INSERT_LINEWORKS_USER,
+        texts,
+    )
+    .await
+    {
+        Ok(u) => Json(u).into_response(),
+        Err(e) => db_error(&state, "upsert-lineworks", &e),
+    }
+}
+
+async fn upsert_line(State(state): State<InternalState>, body: axum::body::Body) -> Response {
+    let b: UpsertLineBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match upsert_by_id(
+        &state,
+        &mut *state.pg.lock().await,
+        b.tenant_id,
+        login_sql::USER_BY_LINE_USER_ID,
+        login_sql::INSERT_LINE_USER,
+        vec![b.line_user_id, b.name],
+    )
+    .await
+    {
+        Ok(u) => Json(u).into_response(),
+        Err(e) => db_error(&state, "upsert-line", &e),
+    }
+}
+
+/// LINE の user id で user を引く。無ければ 200 `null` (移植元と同じ。404 にしない)
+async fn user_by_line_id(
+    State(state): State<InternalState>,
+    query: Result<Query<ByLineIdQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(q)) = query else {
+        return error(StatusCode::BAD_REQUEST, "invalid_query");
+    };
+    let pg = &mut *state.pg.lock().await;
+    let found = match pg::find_user_by(pg, login_sql::USER_BY_LINE_USER_ID, q.line_user_id).await {
+        Ok(Some(u)) => with_slug(pg, u).await.map(Some),
+        other => other.map(|_| None),
+    };
+    match found {
+        Ok(u) => Json::<Option<UserWithSlug>>(u).into_response(),
+        Err(e) => db_error(&state, "users/by-line-id", &e),
+    }
+}
+
+async fn register_line_recipient(
+    State(state): State<InternalState>,
+    body: axum::body::Body,
+) -> Response {
+    let b: RegisterLineRecipientBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match pg::register_line_recipient(
+        &mut *state.pg.lock().await,
+        b.tenant_id,
+        b.name,
+        b.line_user_id,
+    )
+    .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => db_error(&state, "recipients/register-line", &e),
+    }
+}
+
+async fn recipients_by_line_id(
+    State(state): State<InternalState>,
+    query: Result<Query<ByLineIdQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(q)) = query else {
+        return error(StatusCode::BAD_REQUEST, "invalid_query");
+    };
+    match pg::find_recipients_by_line_user_id(&mut *state.pg.lock().await, q.line_user_id).await {
+        Ok(rows) => Json::<Vec<RecipientTenant>>(rows).into_response(),
+        Err(e) => db_error(&state, "recipients/by-line-id", &e),
+    }
 }
 
 async fn refresh_token(State(state): State<InternalState>, body: axum::body::Body) -> Response {
