@@ -24,3 +24,8 @@ path = "crates/auth/src/pg.rs"
 # 内部口 (404 (secret / 不在) / 400 / 409 / 201 / 200 / 500 まで。tests/api_db.rs が通す)
 [[files]]
 path = "crates/auth/src/internal.rs"
+
+# ログインの内部口 (Google・refresh token・SSO 設定。403 / 404 / 400 / 204 / 200 / 500 と STAGING_MODE の判定まで。
+# tests/api_db.rs と単体テストが通す)
+[[files]]
+path = "crates/auth/src/login.rs"

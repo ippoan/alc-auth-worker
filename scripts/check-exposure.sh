@@ -10,6 +10,8 @@
 #   - どの env (staging を含む) にも workers_dev = true / preview_urls = true が無い
 #     (入口は Service Binding だけ。トップレベルの true を env が継承するのも不可)
 #   - どの vars にも ALLOW_INSECURE_DB (DB への平文接続を許すローカル専用フラグ) が無い
+#   - STAGING_MODE (Google の初回ログインで会社を作る) は env.staging の vars にだけ在る
+#     (トップレベル (本番) とほかの env の vars に無い)
 #   - トップレベル (本番) に平文 (NoTls + trust) で繋ぐ DB の binding が無い: vpc_services /
 #     vpc_networks (Workers VPC)。この worker は VPC の段を持たないが、本番に紛れると平文の経路になりうるので禁じたままにする
 #   - containers はどの階層にも無い。migrations (Durable Object の class の定義) もどの階層にも無い
@@ -65,6 +67,11 @@ for name, e in envs.items():
 for scope, table in [("トップレベル", cfg)] + [(f"env.{n}", e) for n, e in envs.items()]:
     if "ALLOW_INSECURE_DB" in table.get("vars", {}):
         err(f"{scope} の vars に ALLOW_INSECURE_DB がある (DB 接続が平文に落ちうる。ローカル専用)")
+
+# 会社を自動で作るフラグは staging にだけ置く (本番で招待の無い人に会社を作らせない)
+for scope, table in [("トップレベル", cfg)] + [(f"env.{n}", e) for n, e in envs.items() if n != "staging"]:
+    if "STAGING_MODE" in table.get("vars", {}):
+        err(f"{scope} の vars に STAGING_MODE がある (会社の自動作成は env.staging だけ)")
 
 # 平文の DB 経路の binding は本番に置かない (本番の DB 接続は Hyperdrive だけ)
 for key in ("vpc_services", "vpc_networks"):

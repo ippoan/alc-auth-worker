@@ -68,15 +68,30 @@ fn other(what: &str) -> impl Fn(worker::Error) -> ConnectError + '_ {
     move |e| ConnectError::Other(format!("{what}: {e}"))
 }
 
-pub async fn connect(env: &Env) -> Result<PgClient, ConnectError> {
+/// 繋いだ接続と、Hyperdrive の段 (本番) で繋いだか (STAGING_MODE の起動ガードが見る。src/lib.rs)
+pub struct Connected {
+    pub client: PgClient,
+    pub via_hyperdrive: bool,
+}
+
+pub async fn connect(env: &Env) -> Result<Connected, ConnectError> {
+    let other_route = |client| Connected {
+        client,
+        via_hyperdrive: false,
+    };
     // DO の段を先頭に。binding が在るのに繋がらなければエラー
     if let Ok(ns) = env.durable_object(STAGING_DB_BINDING) {
-        return connect_do(&ns).await;
+        return connect_do(&ns).await.map(other_route);
     }
     // Hyperdrive の段 (ALLOW_INSECURE_DB は下の文字列の段でしか読まない)。
     // エラーの文は kit の Display = binding 名・段の label・kind だけ (文・宛先を含まない)
     match alc_worker_db::hyperdrive::connect(env, AUTH_HYPERDRIVE_BINDING).await {
-        Ok(Some(client)) => return Ok(client),
+        Ok(Some(client)) => {
+            return Ok(Connected {
+                client,
+                via_hyperdrive: true,
+            })
+        }
         // binding が無い → 次の段 (ローカルの文字列) へ
         Ok(None) => {}
         // 在るのに使えない → 500 (次の段へ落とさない)
@@ -86,7 +101,9 @@ pub async fn connect(env: &Env) -> Result<PgClient, ConnectError> {
         let allow_insecure = env
             .var(ALLOW_INSECURE_DB_VAR)
             .is_ok_and(|v| v.to_string() == "1");
-        return connect_url(&url.to_string(), allow_insecure, DATABASE_URL_SECRET).await;
+        return connect_url(&url.to_string(), allow_insecure, DATABASE_URL_SECRET)
+            .await
+            .map(other_route);
     }
     Err(ConnectError::NotConfigured)
 }

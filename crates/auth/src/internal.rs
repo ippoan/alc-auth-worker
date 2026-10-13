@@ -7,6 +7,8 @@
 //! | POST | `/internal/machine-credentials/{username}/revoke` | 200 `{revoked:true}` / 400 / 404 (その会社に無い) |
 //! | GET | `/internal/machine-credentials/{username}` | 200 `{tenant_id,purpose,secret_hash,revoked}` / 404 (会社をまたいで照合) |
 //!
+//! ログインの口 (`/internal/auth/…`) は [`crate::login`] に在り、同じ router に載せて同じ layer で守る。
+//!
 //! **全部の口 (と当たらない path) を共有 secret (`X-Internal-Shared-Secret`、constant-time 比較) で守り、
 //! 一致しなければ 404** (口が在ることも見せない。本文は当たらない path と同じ空)。tenant は body / query で受ける
 //! (`X-Tenant-ID` は見ない。auth-worker が自分の認可を済ませてから呼ぶ)。
@@ -31,6 +33,7 @@ use serde_json::json;
 use tokio_postgres::error::SqlState;
 
 use crate::creds::{check_create, check_list, valid_username, CreateInput, ListQuery, RevokeInput};
+use crate::login::login_routes;
 use crate::pg;
 use crate::secret::secret_matches;
 
@@ -39,7 +42,7 @@ const ONE_PATH: &str = "/internal/machine-credentials/{username}";
 const REVOKE_PATH: &str = "/internal/machine-credentials/{username}/revoke";
 /// 共有 secret を載せるヘッダー (ippoan/rust-leave-worker の `/internal/ingest` と同じ名前)
 pub const SECRET_HEADER: &str = "X-Internal-Shared-Secret";
-/// body の大きさの上限 (入力は短い文字列 5 つだけ)
+/// body の大きさの上限 (入力は短い文字列 5 つまで)
 const MAX_BODY_BYTES: usize = 4096;
 
 /// ログの出し先 (worker は console、テストは Vec)
@@ -51,6 +54,8 @@ pub struct InternalState {
     /// Secrets Store の `INTERNAL_SHARED_SECRET`。取れなかった (`None`) なら全部 404
     pub secret: Option<Arc<str>>,
     pub log: LogSink,
+    /// Google の初回ログインで会社を作ってよいか (staging だけ。決め方は [`crate::login::staging_mode`])
+    pub staging_mode: bool,
 }
 
 pub fn internal_router(state: InternalState) -> Router {
@@ -58,6 +63,7 @@ pub fn internal_router(state: InternalState) -> Router {
         .route(CREDENTIALS_PATH, post(create).get(list))
         .route(ONE_PATH, get(lookup))
         .route(REVOKE_PATH, post(revoke))
+        .merge(login_routes())
         // `layer` は当たらない path (fallback) にも掛かる: secret が無ければ口の有無も分からない
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -79,7 +85,7 @@ async fn require_secret(State(state): State<InternalState>, req: Request, next: 
     next.run(req).await
 }
 
-fn error(status: StatusCode, code: &str) -> Response {
+pub(crate) fn error(status: StatusCode, code: &str) -> Response {
     (status, Json(json!({ "error": code }))).into_response()
 }
 
@@ -87,13 +93,13 @@ fn not_found() -> Response {
     error(StatusCode::NOT_FOUND, "not_found")
 }
 
-fn db_error(state: &InternalState, what: &str, e: &tokio_postgres::Error) -> Response {
+pub(crate) fn db_error(state: &InternalState, what: &str, e: &tokio_postgres::Error) -> Response {
     (state.log)(&format!("{what}: {}", alc_worker_db::kind(e)));
     error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
 }
 
 /// body を JSON として読む。大きすぎる・JSON でない・形が違うは 400 `invalid_body`
-async fn read_json<T: DeserializeOwned>(body: Body) -> Result<T, Response> {
+pub(crate) async fn read_json<T: DeserializeOwned>(body: Body) -> Result<T, Response> {
     let bytes: Bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
         .await
         .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_body"))?;

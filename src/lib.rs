@@ -15,6 +15,7 @@ mod db;
 
 use std::sync::Arc;
 
+use auth::login::staging_mode;
 use auth::{internal_router, InternalState, LogSink};
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
@@ -24,6 +25,9 @@ use worker::{console_error, event, Context, Env, HttpRequest, Result, WorkerVers
 
 /// 内部口の共有 secret (Secrets Store の binding。`.get()` で実値にする)
 const INTERNAL_SECRET_BINDING: &str = "INTERNAL_SHARED_SECRET";
+/// Google の初回ログインで会社を作ってよいか (`"1"` で有効)。wrangler.toml の `[env.staging.vars]` にだけ置く
+/// (scripts/check-exposure.sh が検査する)。Hyperdrive の段 (本番) で有効なら全部の口を 500 にする
+const STAGING_MODE_VAR: &str = "STAGING_MODE";
 
 /// 共有 secret の実値。取れなければ `None` (口は全部 404)
 async fn internal_secret(env: &Env) -> Option<Arc<str>> {
@@ -50,7 +54,10 @@ fn error_response(status: StatusCode, code: &str) -> Response<Body> {
 #[event(fetch)]
 async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Body>> {
     // 全リクエストで routing の前に繋ぐ (ippoan/rust-leave-worker と同じ)
-    let pg = match db::connect(&env).await {
+    let db::Connected {
+        client: pg,
+        via_hyperdrive,
+    } = match db::connect(&env).await {
         Ok(c) => c,
         Err(db::ConnectError::NotConfigured) => {
             console_error!("auth: {}", db::ConnectError::NotConfigured);
@@ -67,10 +74,22 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
             ));
         }
     };
+    let staging_var = env.var(STAGING_MODE_VAR).ok().map(|v| v.to_string());
+    let staging_mode = match staging_mode(staging_var.as_deref(), via_hyperdrive) {
+        Ok(on) => on,
+        Err(e) => {
+            console_error!("auth: {e}");
+            return Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+            ));
+        }
+    };
     let state = InternalState {
         pg: Arc::new(Mutex::new(pg)),
         secret: internal_secret(&env).await,
         log: log_sink(),
+        staging_mode,
     };
     let mut resp = match internal_router(state).call(req).await {
         Ok(r) => r,

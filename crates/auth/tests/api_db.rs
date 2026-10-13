@@ -1,12 +1,12 @@
-//! 機械用資格情報の内部口 4 本を、口から実 DB (RLS が効く `alc_api_app`) まで通すテスト。
+//! 機械用資格情報の内部口 4 本とログインの内部口 3 本を、口から実 DB (RLS が効く `alc_api_app`) まで通すテスト。
 //! 接続先は `AUTH_TEST_ADMIN_DATABASE_URL` (未設定なら失敗する。tests/support/mod.rs)。
 
 mod support;
 
 use serde_json::{json, Value};
 use support::{
-    app, app_without_secret, broken_app, call, call_raw, delete_tenant, tenant, username, App,
-    SECRET,
+    app, app_staging, app_without_secret, broken_app, call, call_raw, delete_tenant, tenant,
+    username, App, SECRET,
 };
 use uuid::Uuid;
 
@@ -289,7 +289,7 @@ async fn deleting_tenant_cascades() {
     assert_eq!(list(&a, t).await, json!({"credentials": []}));
 }
 
-/// 共有 secret が無い・違う・worker 側で取れない ときは、4 口とも (と当たらない path も) 404 で本文は空。DB にも届かない
+/// 共有 secret が無い・違う・worker 側で取れない ときは、7 口とも (と当たらない path も) 404 で本文は空。DB にも届かない
 #[tokio::test]
 async fn wrong_secret_is_404_everywhere() {
     let a = app().await;
@@ -299,11 +299,16 @@ async fn wrong_secret_is_404_everywhere() {
     let v = username();
     let create_body = serde_json::to_vec(&body(&v, t, "x")).unwrap();
     let revoke_body = serde_json::to_vec(&json!({ "tenant_id": t })).unwrap();
-    let requests: [(&str, String, Option<Vec<u8>>); 5] = [
+    let google_body = serde_json::to_vec(&google_body(&gsub(), "x@example.test")).unwrap();
+    let refresh_body = serde_json::to_vec(&refresh_body(Uuid::new_v4())).unwrap();
+    let requests: [(&str, String, Option<Vec<u8>>); 8] = [
         ("POST", PATH.to_owned(), Some(create_body)),
         ("GET", format!("{PATH}?tenant_id={t}"), None),
         ("POST", format!("{PATH}/{u}/revoke"), Some(revoke_body)),
         ("GET", format!("{PATH}/{u}"), None),
+        ("GET", format!("{SSO}?provider=lineworks&domain=x"), None),
+        ("POST", GOOGLE.to_owned(), Some(google_body)),
+        ("POST", REFRESH.to_owned(), Some(refresh_body)),
         ("GET", "/internal/nothing".to_owned(), None),
     ];
     let no_secret = app_without_secret().await;
@@ -342,14 +347,435 @@ async fn db_failure_is_500() {
         call(&a, "GET", &format!("{PATH}?tenant_id={t}"), None).await,
         revoke(&a, &u, t).await,
         lookup(&a, &u).await,
+        call(
+            &a,
+            "GET",
+            &format!("{SSO}?provider=lineworks&domain=x"),
+            None,
+        )
+        .await,
+        google(&a, &u, "u@example.test").await,
+        call(&a, "POST", REFRESH, Some(refresh_body(t))).await,
     ] {
         assert_eq!(got.status, 500);
         assert_eq!(got.json(), json!({"error": "internal_error"}));
     }
     let logs = a.logs.lock().unwrap().clone();
-    assert_eq!(logs.len(), 4, "{logs:?}");
-    for (log, what) in logs.iter().zip(["create", "list", "revoke", "lookup"]) {
+    assert_eq!(logs.len(), 7, "{logs:?}");
+    let whats = [
+        "create",
+        "list",
+        "revoke",
+        "lookup",
+        "sso-config",
+        "upsert-google",
+        "refresh-token",
+    ];
+    for (log, what) in logs.iter().zip(whats) {
         assert!(log.starts_with(&format!("{what}: ")), "{log}");
         assert!(!log.contains(&u), "{log}");
+        assert!(!log.contains("example.test"), "{log}");
     }
+}
+
+// ---------- ログインの口 (Google・refresh token・SSO 設定) ----------
+
+const SSO: &str = "/internal/auth/sso-config";
+const GOOGLE: &str = "/internal/auth/users/upsert-google";
+const REFRESH: &str = "/internal/auth/refresh-token";
+const REFRESH_HASH: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+fn gsub() -> String {
+    format!("gsub-{}", Uuid::new_v4().simple())
+}
+
+/// 乱数のドメイン (どの会社の email_domain とも当たらない)
+fn domain() -> String {
+    format!("d{}.example.test", Uuid::new_v4().simple())
+}
+
+fn google_body(sub: &str, email: &str) -> Value {
+    json!({ "google_sub": sub, "email": email, "name": "Google User" })
+}
+
+fn refresh_body(user_id: Uuid) -> Value {
+    json!({ "user_id": user_id, "refresh_hash": REFRESH_HASH, "expires_at": "2030-01-02T03:04:05Z" })
+}
+
+async fn google(a: &App, sub: &str, email: &str) -> support::Got {
+    call(a, "POST", GOOGLE, Some(google_body(sub, email))).await
+}
+
+/// superuser で文を流す (準備と確認だけ)
+async fn su_exec(sql: &str) {
+    support::admin().await.batch_execute(sql).await.unwrap();
+}
+
+/// superuser で 1 行 1 列の数を読む
+async fn su_count(sql: &str) -> i64 {
+    support::admin().await.query_typed(sql, &[]).await.unwrap()[0].get(0)
+}
+
+/// 会社の email_domain と slug を変える
+async fn set_tenant(t: Uuid, email_domain: Option<&str>, slug: Option<&str>) {
+    let q = |v: Option<&str>| v.map_or("NULL".to_owned(), |v| format!("'{v}'"));
+    su_exec(&format!(
+        "UPDATE alc_api.tenants SET email_domain = {}, slug = {} WHERE id = '{t}'",
+        q(email_domain),
+        q(slug)
+    ))
+    .await;
+}
+
+async fn invite(t: Uuid, email: &str, role: &str) {
+    su_exec(&format!(
+        "INSERT INTO alc_api.tenant_allowed_emails (tenant_id, email, role) VALUES ('{t}', '{email}', '{role}')"
+    ))
+    .await;
+}
+
+fn keys(v: &Value) -> Vec<String> {
+    let mut k: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+    k.sort();
+    k
+}
+
+/// Google: 招待の email の初回ログインは、招待の会社・招待の role (email_domain が別の会社に当たっても招待が先) で作り、
+/// 招待は消える。返す形は user の 8 列 + slug
+#[tokio::test]
+async fn google_invitation_creates_user_with_invited_role() {
+    let a = app().await;
+    let (invited, by_domain) = (tenant().await, tenant().await);
+    let d = domain();
+    set_tenant(invited, None, Some(&format!("slug-{invited}"))).await;
+    set_tenant(by_domain, Some(&d), None).await;
+    let email = format!("someone@{d}");
+    invite(invited, &email, "viewer").await;
+    let sub = gsub();
+
+    let got = google(&a, &sub, &email).await;
+    assert_eq!(got.status, 200);
+    let u = got.json();
+    assert_eq!(
+        keys(&u),
+        [
+            "email",
+            "google_sub",
+            "id",
+            "line_user_id",
+            "lineworks_id",
+            "name",
+            "role",
+            "slug",
+            "tenant_id"
+        ]
+    );
+    assert_eq!(u["tenant_id"], json!(invited));
+    assert_eq!(u["role"], "viewer", "招待の role で作る (admin にしない)");
+    assert_eq!(u["google_sub"], json!(sub));
+    assert_eq!(u["email"], json!(email));
+    assert_eq!(u["name"], "Google User");
+    assert_eq!(u["lineworks_id"], Value::Null);
+    assert_eq!(u["line_user_id"], Value::Null);
+    assert_eq!(u["slug"], json!(format!("slug-{invited}")));
+    let left = su_count(&format!(
+        "SELECT count(*) FROM alc_api.tenant_allowed_emails WHERE email = '{email}'"
+    ))
+    .await;
+    assert_eq!(left, 0, "招待は使い済みで消える");
+}
+
+/// Google: 招待の role は payroll も admin もそのまま写す
+#[tokio::test]
+async fn google_invitation_role_is_copied() {
+    let a = app().await;
+    let t = tenant().await;
+    for role in ["payroll", "admin"] {
+        let email = format!("{role}@{}", domain());
+        invite(t, &email, role).await;
+        let got = google(&a, &gsub(), &email).await;
+        assert_eq!(got.status, 200);
+        assert_eq!(got.json()["role"], role);
+        assert_eq!(got.json()["tenant_id"], json!(t));
+    }
+}
+
+/// Google: 既存の user (sub の一致) はそのまま返す (email / name / role は書き換えず、行も増えない)
+#[tokio::test]
+async fn google_existing_user_is_returned_as_is() {
+    let a = app().await;
+    let t = tenant().await;
+    let d = domain();
+    set_tenant(t, Some(&d), None).await;
+    let sub = gsub();
+    let first = google(&a, &sub, &format!("a@{d}")).await.json();
+    assert_eq!(first["role"], "admin");
+    su_exec(&format!(
+        "UPDATE alc_api.users SET role = 'viewer' WHERE id = '{}'",
+        first["id"].as_str().unwrap()
+    ))
+    .await;
+    let renamed =
+        json!({ "google_sub": sub, "email": "other@other.example.test", "name": "Renamed" });
+    let got = call(&a, "POST", GOOGLE, Some(renamed)).await;
+    assert_eq!(got.status, 200);
+    let again = got.json();
+    assert_eq!(again["id"], first["id"]);
+    assert_eq!(again["role"], "viewer");
+    assert_eq!(again["email"], json!(format!("a@{d}")));
+    assert_eq!(again["name"], "Google User");
+    assert_eq!(again["slug"], Value::Null);
+    let rows = su_count(&format!(
+        "SELECT count(*) FROM alc_api.users WHERE google_sub = '{sub}'"
+    ))
+    .await;
+    assert_eq!(rows, 1);
+}
+
+/// Google: 招待が無く email_domain が会社に当たれば、その会社の admin
+#[tokio::test]
+async fn google_email_domain_match_is_admin() {
+    let a = app().await;
+    let t = tenant().await;
+    let d = domain();
+    set_tenant(t, Some(&d), Some(&format!("slug-{t}"))).await;
+    let got = google(&a, &gsub(), &format!("someone@{d}")).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["tenant_id"], json!(t));
+    assert_eq!(got.json()["role"], "admin");
+    assert_eq!(got.json()["slug"], json!(format!("slug-{t}")));
+}
+
+/// Google: 招待も email_domain の一致も無ければ、本番 (STAGING_MODE 無効) は 403 で、会社も user も作らない。
+/// ログに email を出さない
+#[tokio::test]
+async fn google_without_tenant_is_403_in_production() {
+    let a = app().await;
+    let d = domain();
+    let sub = gsub();
+    let got = google(&a, &sub, &format!("nobody@{d}")).await;
+    assert_eq!(got.status, 403);
+    assert_eq!(got.json(), json!({"error": "no_tenant_for_email"}));
+    let tenants = su_count(&format!(
+        "SELECT count(*) FROM alc_api.tenants WHERE email_domain = '{d}'"
+    ))
+    .await;
+    assert_eq!(tenants, 0);
+    let users = su_count(&format!(
+        "SELECT count(*) FROM alc_api.users WHERE google_sub = '{sub}'"
+    ))
+    .await;
+    assert_eq!(users, 0);
+    assert_eq!(
+        *a.logs.lock().unwrap(),
+        ["upsert-google: no tenant for email"]
+    );
+}
+
+/// Google: STAGING_MODE では、会社 (名前・email_domain = ドメイン) を作ってその admin にする。
+/// 同じドメインの 2 人目は、作った会社に email_domain で当たる
+#[tokio::test]
+async fn google_without_tenant_creates_tenant_in_staging() {
+    let a = app_staging().await;
+    let d = domain();
+    let got = google(&a, &gsub(), &format!("first@{d}")).await;
+    assert_eq!(got.status, 200);
+    let first = got.json();
+    assert_eq!(first["role"], "admin");
+    let t = first["tenant_id"].as_str().unwrap().to_owned();
+    let made = su_count(&format!(
+        "SELECT count(*) FROM alc_api.tenants WHERE id = '{t}' AND name = '{d}' AND email_domain = '{d}'"
+    ))
+    .await;
+    assert_eq!(made, 1);
+    let second = google(&a, &gsub(), &format!("second@{d}")).await.json();
+    assert_eq!(second["tenant_id"].as_str().unwrap(), t);
+    assert_eq!(second["role"], "admin");
+    assert_eq!(
+        *a.logs.lock().unwrap(),
+        ["upsert-google: staging tenant created"]
+    );
+}
+
+/// STAGING_MODE でも、招待・email_domain の一致が先 (会社を作らない)
+#[tokio::test]
+async fn google_staging_prefers_invitation_and_domain() {
+    let a = app_staging().await;
+    let t = tenant().await;
+    let d = domain();
+    set_tenant(t, Some(&d), None).await;
+    let email = format!("inv@{}", domain());
+    invite(t, &email, "viewer").await;
+    let by_invitation = google(&a, &gsub(), &email).await.json();
+    assert_eq!(by_invitation["tenant_id"], json!(t));
+    assert_eq!(by_invitation["role"], "viewer");
+    let by_domain = google(&a, &gsub(), &format!("x@{d}")).await.json();
+    assert_eq!(by_domain["tenant_id"], json!(t));
+    assert_eq!(by_domain["role"], "admin");
+    assert!(a.logs.lock().unwrap().is_empty());
+}
+
+/// 会社の作成の再試行: UNIQUE 違反は回数まで流し直し、最後の UNIQUE 違反はそのまま返す。
+/// ほかのエラーと成功は流し直さない
+#[tokio::test]
+async fn retry_on_unique_counts_attempts() {
+    use alc_worker_db::PgClient;
+    use auth::pg::retry_on_unique;
+    use futures_util::future::BoxFuture;
+
+    /// 1 文を nil の tenant の transaction で流す
+    fn attempt(
+        pg: &mut PgClient,
+        sql: String,
+    ) -> BoxFuture<'_, Result<u64, tokio_postgres::Error>> {
+        Box::pin(pg.tenant_tx(Uuid::nil(), move |tx| {
+            Box::pin(async move { tx.execute_typed(&sql, &[]).await })
+        }))
+    }
+
+    let mut pg = support::app_client().await;
+    let t = tenant().await;
+    let dup = format!("INSERT INTO alc_api.tenants (id, name) VALUES ('{t}', 'dup')");
+    let mut calls = 0;
+    // ずっと UNIQUE 違反 → 3 回で止まり 23505
+    let e = retry_on_unique(&mut pg, 3, |pg| {
+        calls += 1;
+        attempt(pg, dup.clone())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(alc_worker_db::kind(&e), "23505");
+    assert_eq!(calls, 3);
+    // 2 回目で通る
+    calls = 0;
+    let n = retry_on_unique(&mut pg, 3, |pg| {
+        calls += 1;
+        let sql = if calls == 2 { "SELECT 1" } else { &dup };
+        attempt(pg, sql.to_owned())
+    })
+    .await
+    .unwrap();
+    assert_eq!((n, calls), (1, 2));
+    // UNIQUE 違反でなければ流し直さない
+    calls = 0;
+    let e = retry_on_unique(&mut pg, 3, |pg| {
+        calls += 1;
+        attempt(pg, "SELECT 1 / 0".to_owned())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!((alc_worker_db::kind(&e).as_str(), calls), ("22012", 1));
+}
+
+/// refresh token: 渡した user の行だけに hash と期限を書き、204。無い user も 204 (移植元と同じ)
+#[tokio::test]
+async fn refresh_token_is_saved_for_the_given_user_only() {
+    let a = app().await;
+    let t = tenant().await;
+    let d = domain();
+    set_tenant(t, Some(&d), None).await;
+    let target = google(&a, &gsub(), &format!("a@{d}")).await.json();
+    let other = google(&a, &gsub(), &format!("b@{d}")).await.json();
+    let id = target["id"].as_str().unwrap();
+    let got = call(&a, "POST", REFRESH, Some(refresh_body(id.parse().unwrap()))).await;
+    assert_eq!(got.status, 204);
+    assert!(got.body.is_empty());
+    let saved = su_count(&format!(
+        "SELECT count(*) FROM alc_api.users WHERE id = '{id}' AND refresh_token_hash = '{REFRESH_HASH}' \
+         AND refresh_token_expires_at = '2030-01-02T03:04:05Z'"
+    ))
+    .await;
+    assert_eq!(saved, 1);
+    let untouched = su_count(&format!(
+        "SELECT count(*) FROM alc_api.users WHERE id = '{}' AND refresh_token_hash IS NULL",
+        other["id"].as_str().unwrap()
+    ))
+    .await;
+    assert_eq!(untouched, 1);
+    let got = call(&a, "POST", REFRESH, Some(refresh_body(Uuid::new_v4()))).await;
+    assert_eq!(got.status, 204);
+}
+
+/// SSO 設定: external_org_id の完全一致 → 無ければ slug で引き直す → provider 違い・無効・無いは 404
+#[tokio::test]
+async fn sso_config_exact_slug_and_not_found() {
+    let a = app().await;
+    let (t, disabled) = (tenant().await, tenant().await);
+    let slug = format!("slug-{t}");
+    set_tenant(t, None, Some(&slug)).await;
+    let org = format!("org-{t}");
+    su_exec(&format!(
+        "INSERT INTO alc_api.sso_provider_configs \
+         (tenant_id, provider, client_id, client_secret_encrypted, external_org_id, woff_id) \
+         VALUES ('{t}', 'lineworks', 'cid-{t}', 'enc-{t}', '{org}', 'woff-{t}'); \
+         INSERT INTO alc_api.sso_provider_configs \
+         (tenant_id, provider, client_id, client_secret_encrypted, external_org_id, enabled) \
+         VALUES ('{disabled}', 'lineworks', 'cid-{disabled}', 'enc', 'org-{disabled}', false)"
+    ))
+    .await;
+    let want = json!({
+        "tenant_id": t,
+        "client_id": format!("cid-{t}"),
+        "client_secret_encrypted": format!("enc-{t}"),
+        "external_org_id": org,
+        "woff_id": format!("woff-{t}"),
+    });
+    for d in [&org, &slug] {
+        let got = call(
+            &a,
+            "GET",
+            &format!("{SSO}?provider=lineworks&domain={d}"),
+            None,
+        )
+        .await;
+        assert_eq!(got.status, 200, "{d}");
+        assert_eq!(got.json(), want, "{d}");
+    }
+    for uri in [
+        format!("{SSO}?provider=google&domain={org}"),
+        format!("{SSO}?provider=lineworks&domain=org-{disabled}"),
+        format!("{SSO}?provider=lineworks&domain=nothing-{t}"),
+    ] {
+        let got = call(&a, "GET", &uri, None).await;
+        assert_eq!(got.status, 404, "{uri}");
+        assert_eq!(
+            got.json(),
+            json!({"error": "sso_config_not_found"}),
+            "{uri}"
+        );
+    }
+}
+
+/// ログインの口の入力の不正は 400 (DB に届かない)
+#[tokio::test]
+async fn bad_login_input_is_400() {
+    let a = app().await;
+    for uri in [
+        SSO.to_owned(),
+        format!("{SSO}?provider=lineworks"),
+        format!("{SSO}?domain=x"),
+    ] {
+        let got = call(&a, "GET", &uri, None).await;
+        assert_eq!(got.status, 400, "{uri}");
+        assert_eq!(got.json(), json!({"error": "invalid_query"}), "{uri}");
+    }
+    let bodies = [
+        (GOOGLE, json!({"google_sub": "x", "email": "y"})),
+        (
+            REFRESH,
+            json!({"user_id": "x", "refresh_hash": "h", "expires_at": "2030-01-01T00:00:00Z"}),
+        ),
+        (
+            REFRESH,
+            json!({"user_id": Uuid::new_v4(), "refresh_hash": "h", "expires_at": "tomorrow"}),
+        ),
+    ];
+    for (path, b) in bodies {
+        let got = call(&a, "POST", path, Some(b.clone())).await;
+        assert_eq!(got.status, 400, "{b}");
+        assert_eq!(got.json(), json!({"error": "invalid_body"}), "{b}");
+    }
+    let got = call_raw(&a, "POST", REFRESH, Some(SECRET), Some(b"{".to_vec())).await;
+    assert_eq!(got.status, 400);
+    assert!(a.logs.lock().unwrap().is_empty());
 }
