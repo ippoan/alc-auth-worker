@@ -14,5 +14,6 @@ pub mod login;
 pub mod pg;
 pub mod roles;
 pub mod secret;
+pub mod session;
 
 pub use internal::{internal_router, InternalState, LogSink};

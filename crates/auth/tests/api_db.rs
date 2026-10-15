@@ -363,7 +363,7 @@ async fn deleting_tenant_cascades() {
     assert_eq!(list(&a, t).await, json!({"credentials": []}));
 }
 
-/// 共有 secret が無い・違う・worker 側で取れない ときは、16 口とも (と当たらない path も) 404 で本文は空。DB にも届かない
+/// 共有 secret が無い・違う・worker 側で取れない ときは、18 口とも (と当たらない path も) 404 で本文は空。DB にも届かない
 #[tokio::test]
 async fn wrong_secret_is_404_everywhere() {
     let a = app().await;
@@ -382,7 +382,8 @@ async fn wrong_secret_is_404_everywhere() {
     let line = serde_json::to_vec(&line_body(t, &line_id)).unwrap();
     let reg = serde_json::to_vec(&recipient_body(t, &line_id, "x")).unwrap();
     let role_path = format!("/internal/tenants/{t}/users/{}/roles/leave", Uuid::new_v4());
-    let requests: [(&str, String, Option<Vec<u8>>); 17] = [
+    let session_user = Uuid::new_v4();
+    let requests: [(&str, String, Option<Vec<u8>>); 19] = [
         ("POST", PATH.to_owned(), Some(create_body)),
         ("GET", format!("{PATH}?tenant_id={t}"), None),
         ("POST", format!("{PATH}/{u}/revoke"), Some(revoke_body)),
@@ -403,6 +404,8 @@ async fn wrong_secret_is_404_everywhere() {
         ("GET", format!("/internal/tenants/{t}/user-roles"), None),
         ("PUT", role_path.clone(), None),
         ("DELETE", role_path, None),
+        ("GET", format!("/internal/tenants/{t}"), None),
+        ("DELETE", refresh_of(t, session_user), None),
         ("GET", "/internal/nothing".to_owned(), None),
     ];
     let no_secret = app_without_secret().await;
@@ -466,12 +469,14 @@ async fn db_failure_is_500() {
         call(&a, "GET", &roles_of(t), None).await,
         call(&a, "PUT", &role_of(t, Uuid::new_v4(), "leave"), None).await,
         call(&a, "DELETE", &role_of(t, Uuid::new_v4(), "leave"), None).await,
+        call(&a, "GET", &format!("/internal/tenants/{t}"), None).await,
+        call(&a, "DELETE", &refresh_of(t, Uuid::new_v4()), None).await,
     ] {
         assert_eq!(got.status, 500);
         assert_eq!(got.json(), json!({"error": "internal_error"}));
     }
     let logs = a.logs.lock().unwrap().clone();
-    assert_eq!(logs.len(), 16, "{logs:?}");
+    assert_eq!(logs.len(), 18, "{logs:?}");
     let whats = [
         "create",
         "list",
@@ -489,6 +494,8 @@ async fn db_failure_is_500() {
         "user-roles",
         "roles/grant",
         "roles/revoke",
+        "tenants/get",
+        "refresh-token/clear",
     ];
     for (log, what) in logs.iter().zip(whats) {
         assert!(log.starts_with(&format!("{what}: ")), "{log}");
@@ -1441,4 +1448,86 @@ async fn roles_errors() {
     assert_eq!(got.status, 204);
     assert_eq!(role_rows(&u).await, 1, "別の会社からは外せない");
     assert!(a.logs.lock().unwrap().is_empty());
+}
+
+// ---------- staging の me・logout の口 (tenant の読み出しと refresh token の削除) ----------
+
+fn refresh_of(t: impl std::fmt::Display, user: impl std::fmt::Display) -> String {
+    format!("/internal/tenants/{t}/users/{user}/refresh-token")
+}
+
+/// tenant の 1 行: 4 項目で返す (slug 未設定は null)。無い会社は本文つきの 404、UUID でなければ 400
+#[tokio::test]
+async fn tenant_get_returns_row_or_404() {
+    let a = app().await;
+    let t = tenant().await;
+    let got = call(&a, "GET", &format!("/internal/tenants/{t}"), None).await;
+    assert_eq!(got.status, 200);
+    let v = got.json();
+    assert_eq!(keys(&v), ["id", "name", "short_id", "slug"]);
+    assert_eq!(v["id"], json!(t));
+    assert_eq!(v["slug"], Value::Null);
+    assert!(!v["name"].as_str().unwrap().is_empty());
+    assert!(!v["short_id"].as_str().unwrap().is_empty());
+    set_tenant(t, None, Some(&format!("slug-{t}"))).await;
+    let got = call(&a, "GET", &format!("/internal/tenants/{t}"), None).await;
+    assert_eq!(got.json()["slug"], json!(format!("slug-{t}")));
+
+    let got = call(
+        &a,
+        "GET",
+        &format!("/internal/tenants/{}", Uuid::new_v4()),
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 404);
+    assert_eq!(got.json(), json!({"error": "tenant_not_found"}));
+    let got = call(&a, "GET", "/internal/tenants/not-a-uuid", None).await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({"error": "invalid_id"}));
+}
+
+/// refresh token の削除: 自分の会社の user の 2 列だけ NULL にして 204。別の会社の user・無い user・UUID でない id
+#[tokio::test]
+async fn refresh_token_delete_clears_only_own_tenant_user() {
+    let a = app().await;
+    let (t1, t2) = (tenant().await, tenant().await);
+    let (d1, d2) = (domain(), domain());
+    set_tenant(t1, Some(&d1), None).await;
+    set_tenant(t2, Some(&d2), None).await;
+    let u1 = google(&a, &gsub(), &format!("a@{d1}")).await.json();
+    let u1b = google(&a, &gsub(), &format!("b@{d1}")).await.json();
+    let u2 = google(&a, &gsub(), &format!("c@{d2}")).await.json();
+    let ids = [&u1, &u1b, &u2].map(|u| u["id"].as_str().unwrap().to_owned());
+    for id in &ids {
+        let got = call(&a, "POST", REFRESH, Some(refresh_body(id.parse().unwrap()))).await;
+        assert_eq!(got.status, 204);
+    }
+    async fn set(id: &str) -> i64 {
+        su_count(&format!(
+            "SELECT count(*) FROM alc_api.users WHERE id = '{id}' \
+             AND refresh_token_hash IS NOT NULL AND refresh_token_expires_at IS NOT NULL"
+        ))
+        .await
+    }
+    // 別の会社の path では変わらない (該当 0 件でも 204)
+    let got = call(&a, "DELETE", &refresh_of(t2, &ids[0]), None).await;
+    assert_eq!(got.status, 204);
+    assert!(got.body.is_empty());
+    assert_eq!(set(&ids[0]).await, 1);
+    // 正しい会社: 対象の user だけ消える
+    let got = call(&a, "DELETE", &refresh_of(t1, &ids[0]), None).await;
+    assert_eq!(got.status, 204);
+    assert!(got.body.is_empty());
+    assert_eq!(set(&ids[0]).await, 0);
+    assert_eq!(set(&ids[1]).await, 1);
+    assert_eq!(set(&ids[2]).await, 1);
+    // 無い user も 204
+    let got = call(&a, "DELETE", &refresh_of(t1, Uuid::new_v4()), None).await;
+    assert_eq!(got.status, 204);
+    for path in [refresh_of("x", &ids[0]), refresh_of(t1, "x")] {
+        let got = call(&a, "DELETE", &path, None).await;
+        assert_eq!(got.status, 400, "{path}");
+        assert_eq!(got.json(), json!({"error": "invalid_id"}));
+    }
 }

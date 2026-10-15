@@ -21,6 +21,9 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
   users/by-line-id の無しは 200 `null`。user を返す 4 口は `permissions` を足す)、ロールの付け外しの 3 本
   (`GET /internal/tenants/{tenant_id}/user-roles`・`PUT` / `DELETE /internal/tenants/{tenant_id}/users/{user_id}/roles/{role}`。
   `crates/auth/src/roles.rs`。ロール → 権限の対応は同じファイルの `ROLE_PERMISSIONS` に固定、admin は `*`)。
+  staging の me・logout・my-orgs 用の 2 本 (`GET /internal/tenants/{tenant_id}` = 200 `{id,name,slug,short_id}` / 本文つきの 404 `tenant_not_found`、
+  `DELETE /internal/tenants/{tenant_id}/users/{user_id}/refresh-token` = 204。`crates/auth/src/session.rs`。auth-worker の staging から呼ぶ予定 = c76。
+  tenant・user は path で受け、identity ヘッダは読まない)。
   **全部 (と当たらない path) を共有 secret
   (`X-Internal-Shared-Secret`、constant-time 比較) で守り、一致しなければ 404** (本文は空)。tenant は body / query で受ける。
 - **暗号処理を持たない**: パスワードの生成・hash の計算・照合の比較・Google の ID token の検証は auth-worker 側。
@@ -44,6 +47,6 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/auth/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止 (tests/ の superuser の側も `batch_execute` と `query_typed` だけ)。
 - 応答・ログには固定の語だけ (username・email・hash・secret・生のエラー文を出さない)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 9・api_db 32) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 13・api_db 38) はテストを足したら上げる。
 - public repo: ホスト名・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (ippoan/rust-leave-worker と同じ rev)。

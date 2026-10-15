@@ -42,6 +42,7 @@ use crate::login::login_routes;
 use crate::pg;
 use crate::roles::role_routes;
 use crate::secret::secret_matches;
+use crate::session::session_routes;
 
 pub const CREDENTIALS_PATH: &str = "/internal/machine-credentials";
 const ONE_PATH: &str = "/internal/machine-credentials/{username}";
@@ -73,6 +74,7 @@ pub fn internal_router(state: InternalState) -> Router {
         .route(ROTATE_PATH, post(rotate))
         .merge(login_routes())
         .merge(role_routes())
+        .merge(session_routes())
         // `layer` は当たらない path (fallback) にも掛かる: secret が無ければ口の有無も分からない
         .layer(middleware::from_fn_with_state(
             state.clone(),
