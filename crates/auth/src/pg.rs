@@ -239,12 +239,12 @@ pub mod login_sql {
     pub const RECIPIENTS_BY_LINE_USER_ID: &str =
         "SELECT tenant_id, recipient_name FROM alc_api.find_recipient_by_line_user_id($1)";
 
-    /// refresh token の hash と期限を保存する (SECURITY DEFINER。158。引数は (user_id, hash, expires_at))
-    /// ログアウト (staging の me・logout を alc-auth-worker が答える口)
+    /// refresh token の hash と期限を NULL に戻す (logout 用。その会社の transaction で)
     pub const CLEAR_REFRESH_TOKEN: &str = "UPDATE alc_api.users \
          SET refresh_token_hash = NULL, refresh_token_expires_at = NULL \
          WHERE id = $1 AND tenant_id = $2";
 
+    /// refresh token の hash と期限を保存する (SECURITY DEFINER。158。引数は (user_id, hash, expires_at))
     pub const SAVE_REFRESH_TOKEN: &str = "SELECT alc_api.save_user_refresh_token($1, $2, $3)";
 
     /// SSO 設定 (SECURITY DEFINER。ippoan/alc-migrations の 174。external_org_id で完全一致し、
