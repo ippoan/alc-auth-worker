@@ -205,7 +205,9 @@ pub mod login_sql {
     pub const ENSURE_TENANT: &str = "INSERT INTO alc_api.tenants (id, name) \
          VALUES ($1, 'LINE WORKS (staging auto)') ON CONFLICT (id) DO NOTHING";
 
-    pub const TENANT_SLUG: &str = "SELECT slug FROM alc_api.tenants WHERE id = $1";
+    /// 会社の 1 行 (me と slug。RLS の tenants_policy は自分の会社の行だけ見せる)
+    pub const TENANT_ROW: &str =
+        "SELECT id, name, slug, short_id FROM alc_api.tenants WHERE id = $1";
 
     pub const INSERT_GOOGLE_USER: &str = concat!(
         "INSERT INTO alc_api.users (tenant_id, google_sub, email, name, role) \
@@ -236,6 +238,11 @@ pub mod login_sql {
     /// LINE の user id で有効な受信者を会社をまたいで逆引き (SECURITY DEFINER。081。複数の会社に居れば全部)
     pub const RECIPIENTS_BY_LINE_USER_ID: &str =
         "SELECT tenant_id, recipient_name FROM alc_api.find_recipient_by_line_user_id($1)";
+
+    /// refresh token の hash と期限を NULL に戻す (logout 用。その会社の transaction で)
+    pub const CLEAR_REFRESH_TOKEN: &str = "UPDATE alc_api.users \
+         SET refresh_token_hash = NULL, refresh_token_expires_at = NULL \
+         WHERE id = $1 AND tenant_id = $2";
 
     /// refresh token の hash と期限を保存する (SECURITY DEFINER。158。引数は (user_id, hash, expires_at))
     pub const SAVE_REFRESH_TOKEN: &str = "SELECT alc_api.save_user_refresh_token($1, $2, $3)";
@@ -420,14 +427,53 @@ pub async fn ensure_tenant(pg: &mut PgClient, tenant_id: Uuid) -> Result<u64, Er
     .await
 }
 
-/// 会社の slug (未設定・会社が無いは `None`)
-pub async fn tenant_slug(pg: &mut PgClient, tenant_id: Uuid) -> Result<Option<String>, Error> {
+/// 会社の 1 行 (`GET /internal/tenants/{tenant_id}`。rust-alc-api の me が読む列)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TenantRow {
+    pub id: Uuid,
+    pub name: String,
+    pub slug: Option<String>,
+    pub short_id: String,
+}
+
+impl TxOutput for TenantRow {}
+
+/// 会社の 1 行 (会社が無ければ `None`。その会社の transaction で)
+pub async fn tenant_row(pg: &mut PgClient, tenant_id: Uuid) -> Result<Option<TenantRow>, Error> {
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
             let row = tx
-                .query_typed_opt(login_sql::TENANT_SLUG, &[(&tenant_id, Type::UUID)])
+                .query_typed_opt(login_sql::TENANT_ROW, &[(&tenant_id, Type::UUID)])
                 .await?;
-            Ok(row.and_then(|r| r.get(0)))
+            Ok(row.map(|r| TenantRow {
+                id: r.get(0),
+                name: r.get(1),
+                slug: r.get(2),
+                short_id: r.get(3),
+            }))
+        })
+    })
+    .await
+}
+
+/// 会社の slug (未設定・会社が無いは `None`)
+pub async fn tenant_slug(pg: &mut PgClient, tenant_id: Uuid) -> Result<Option<String>, Error> {
+    Ok(tenant_row(pg, tenant_id).await?.and_then(|t| t.slug))
+}
+
+/// user の refresh token (hash と期限) を消す。消した行数 (無ければ 0。その会社の transaction で)
+pub async fn clear_refresh_token(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    user_id: Uuid,
+) -> Result<u64, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                login_sql::CLEAR_REFRESH_TOKEN,
+                &[(&user_id, Type::UUID), (&tenant_id, Type::UUID)],
+            )
+            .await
         })
     })
     .await
