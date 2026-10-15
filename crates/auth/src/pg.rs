@@ -545,3 +545,134 @@ pub async fn resolve_sso_config(
     })
     .await
 }
+
+// ---------- ロール (user_roles。ippoan/alc-migrations の 177) ----------
+//
+// 会社の中の表なので、必ずその会社の transaction で流し、tenant_id を WHERE / VALUES に明示する
+// (`tenant_tx(Uuid::nil())` の中では RLS で 0 行になる)。
+
+pub mod roles_sql {
+    /// その user に付いたロール (role 順)
+    pub const ROLES_OF_USER: &str = "SELECT role FROM alc_api.user_roles \
+         WHERE tenant_id = $1 AND user_id = $2 ORDER BY role";
+
+    /// 会社の中で 1 つ以上ロールを持つ user と、そのロール (user_id 順・role 順)
+    pub const ROLES_OF_TENANT: &str = "SELECT user_id, array_agg(role ORDER BY role) \
+         FROM alc_api.user_roles WHERE tenant_id = $1 GROUP BY user_id ORDER BY user_id";
+
+    /// その会社に user が在るか (付ける前の確かめ)
+    pub const USER_EXISTS: &str =
+        "SELECT EXISTS (SELECT 1 FROM alc_api.users WHERE id = $1 AND tenant_id = $2)";
+
+    /// 付ける (既に在れば何もしない)
+    pub const GRANT_ROLE: &str = "INSERT INTO alc_api.user_roles (tenant_id, user_id, role) \
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING";
+
+    /// 外す (無くても何もしない)
+    pub const REVOKE_ROLE: &str = "DELETE FROM alc_api.user_roles \
+         WHERE tenant_id = $1 AND user_id = $2 AND role = $3";
+}
+
+/// 会社の中のロールの一覧の 1 行
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UserRoles {
+    pub user_id: Uuid,
+    pub roles: Vec<String>,
+}
+
+impl TxOutput for UserRoles {}
+
+/// その user に付いたロール (user の会社の transaction で)
+pub async fn roles_of_user(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    user_id: Uuid,
+) -> Result<Vec<String>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(
+                    roles_sql::ROLES_OF_USER,
+                    &[(&tenant_id, Type::UUID), (&user_id, Type::UUID)],
+                )
+                .await?;
+            Ok(rows.iter().map(|r| r.get(0)).collect())
+        })
+    })
+    .await
+}
+
+pub async fn roles_of_tenant(pg: &mut PgClient, tenant_id: Uuid) -> Result<Vec<UserRoles>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(roles_sql::ROLES_OF_TENANT, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| UserRoles {
+                    user_id: r.get(0),
+                    roles: r.get(1),
+                })
+                .collect())
+        })
+    })
+    .await
+}
+
+/// ロールを付ける。その会社に user が無ければ false (何も入れない)。既に付いていても true
+pub async fn grant_role(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    role: String,
+) -> Result<bool, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let exists: bool = tx
+                .query_typed_one(
+                    roles_sql::USER_EXISTS,
+                    &[(&user_id, Type::UUID), (&tenant_id, Type::UUID)],
+                )
+                .await?
+                .get(0);
+            if !exists {
+                return Ok(false);
+            }
+            tx.execute_typed(
+                roles_sql::GRANT_ROLE,
+                &[
+                    (&tenant_id, Type::UUID),
+                    (&user_id, Type::UUID),
+                    (&role, Type::TEXT),
+                ],
+            )
+            .await?;
+            Ok(true)
+        })
+    })
+    .await
+}
+
+/// ロールを外す。消えた行数 (無ければ 0)
+pub async fn revoke_role(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    role: String,
+) -> Result<u64, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                roles_sql::REVOKE_ROLE,
+                &[
+                    (&tenant_id, Type::UUID),
+                    (&user_id, Type::UUID),
+                    (&role, Type::TEXT),
+                ],
+            )
+            .await
+        })
+    })
+    .await
+}

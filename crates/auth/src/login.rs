@@ -4,11 +4,11 @@
 //! | method | path | 応答 |
 //! |---|---|---|
 //! | GET | `/internal/auth/sso-config?provider=…&domain=…` | 200 SSO 設定 / 404 `sso_config_not_found` / 400 |
-//! | POST | `/internal/auth/users/upsert-google` | 200 user (8 列) + `slug` / 403 `no_tenant_for_email` / 400 |
+//! | POST | `/internal/auth/users/upsert-google` | 200 user (8 列) + `slug` + `permissions` / 403 `no_tenant_for_email` / 400 |
 //! | POST | `/internal/auth/refresh-token` | 204 / 400 |
-//! | POST | `/internal/auth/users/upsert-lineworks` | 200 user (8 列) + `slug` / 400 |
-//! | POST | `/internal/auth/users/upsert-line` | 200 user (8 列) + `slug` / 400 |
-//! | GET | `/internal/auth/users/by-line-id?line_user_id=…` | 200 user (8 列) + `slug` / 200 `null` (無い) / 400 |
+//! | POST | `/internal/auth/users/upsert-lineworks` | 200 user (8 列) + `slug` + `permissions` / 400 |
+//! | POST | `/internal/auth/users/upsert-line` | 200 user (8 列) + `slug` + `permissions` / 400 |
+//! | GET | `/internal/auth/users/by-line-id?line_user_id=…` | 200 user (8 列) + `slug` + `permissions` / 200 `null` (無い) / 400 |
 //! | POST | `/internal/auth/recipients/register-line` | 204 (重複も) / 400 |
 //! | GET | `/internal/auth/recipients/by-line-id?line_user_id=…` | 200 `[{tenant_id,name}]` (会社をまたいで全部) / 400 |
 //!
@@ -35,6 +35,7 @@ use alc_worker_db::PgClient;
 
 use crate::internal::{db_error, error, read_json, InternalState};
 use crate::pg::{self, login_sql, RecipientTenant, SsoConfig, User};
+use crate::roles::permissions_for;
 
 pub const SSO_CONFIG_PATH: &str = "/internal/auth/sso-config";
 pub const UPSERT_GOOGLE_PATH: &str = "/internal/auth/users/upsert-google";
@@ -58,12 +59,14 @@ pub fn staging_mode(var: Option<&str>, via_hyperdrive: bool) -> Result<bool, &'s
     }
 }
 
-/// JWT の組み立てに要る user と会社の slug (rust-alc-api の `InternalUserWithSlug` と同じ形)
+/// JWT の組み立てに要る user と会社の slug (rust-alc-api の `InternalUserWithSlug` と同じ形) に、
+/// 権限 (`permissions`。[`crate::roles::permissions_for`]。auth-worker が claim `perms` に詰める) を足したもの
 #[derive(Debug, Serialize)]
 pub struct UserWithSlug {
     #[serde(flatten)]
     pub user: User,
     pub slug: Option<String>,
+    pub permissions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,9 +201,20 @@ async fn upsert_google_user(
     with_slug(pg, user).await.map(Some)
 }
 
+/// 会社の slug と権限を添える。ロールは user の会社の transaction で読む (admin は読まずに `*`)
 async fn with_slug(pg: &mut PgClient, user: User) -> Result<UserWithSlug, tokio_postgres::Error> {
     let slug = pg::tenant_slug(pg, user.tenant_id).await?;
-    Ok(UserWithSlug { user, slug })
+    let roles = if user.role == "admin" {
+        Vec::new()
+    } else {
+        pg::roles_of_user(pg, user.tenant_id, user.id).await?
+    };
+    let permissions = permissions_for(&user.role, &roles);
+    Ok(UserWithSlug {
+        user,
+        slug,
+        permissions,
+    })
 }
 
 /// LINE・LINE WORKS の 1 つの id で既存の user を引き、無ければ body の会社に viewer で作る (STAGING_MODE なら先に

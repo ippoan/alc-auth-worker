@@ -8,7 +8,8 @@
 //! | POST | `/internal/machine-credentials/{username}/rotate` | 200 `{rotated:true}` (secret_hash を差し替える。旧 password は即失効) / 400 / 404 (失効済み・無い・他社) |
 //! | GET | `/internal/machine-credentials/{username}` | 200 `{tenant_id,purpose,secret_hash,revoked}` / 404 (会社をまたいで照合) |
 //!
-//! ログインの口 (`/internal/auth/…`) は [`crate::login`] に在り、同じ router に載せて同じ layer で守る。
+//! ログインの口 (`/internal/auth/…`) は [`crate::login`]、ロールの付け外しの口 (`/internal/tenants/…`) は
+//! [`crate::roles`] に在り、同じ router に載せて同じ layer で守る。
 //!
 //! **全部の口 (と当たらない path) を共有 secret (`X-Internal-Shared-Secret`、constant-time 比較) で守り、
 //! 一致しなければ 404** (口が在ることも見せない。本文は当たらない path と同じ空)。tenant は body / query で受ける
@@ -39,6 +40,7 @@ use crate::creds::{
 };
 use crate::login::login_routes;
 use crate::pg;
+use crate::roles::role_routes;
 use crate::secret::secret_matches;
 
 pub const CREDENTIALS_PATH: &str = "/internal/machine-credentials";
@@ -70,6 +72,7 @@ pub fn internal_router(state: InternalState) -> Router {
         .route(REVOKE_PATH, post(revoke))
         .route(ROTATE_PATH, post(rotate))
         .merge(login_routes())
+        .merge(role_routes())
         // `layer` は当たらない path (fallback) にも掛かる: secret が無ければ口の有無も分からない
         .layer(middleware::from_fn_with_state(
             state.clone(),
