@@ -29,3 +29,7 @@ path = "crates/auth/src/internal.rs"
 # tests/api_db.rs と単体テストが通す)
 [[files]]
 path = "crates/auth/src/login.rs"
+
+# ロールの付け外しの口とロール → 権限の対応 (400 / 404 / 204 / 200 / 500。tests/api_db.rs と単体テストが通す)
+[[files]]
+path = "crates/auth/src/roles.rs"

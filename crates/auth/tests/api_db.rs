@@ -1,4 +1,4 @@
-//! 機械用資格情報の内部口 5 本とログインの内部口 8 本を、口から実 DB (RLS が効く `alc_api_app`) まで通すテスト。
+//! 機械用資格情報の内部口 5 本とログインの内部口 8 本とロールの付け外しの口 3 本を、口から実 DB (RLS が効く `alc_api_app`) まで通すテスト。
 //! 接続先は `AUTH_TEST_ADMIN_DATABASE_URL` (未設定なら失敗する。tests/support/mod.rs)。
 
 mod support;
@@ -363,7 +363,7 @@ async fn deleting_tenant_cascades() {
     assert_eq!(list(&a, t).await, json!({"credentials": []}));
 }
 
-/// 共有 secret が無い・違う・worker 側で取れない ときは、13 口とも (と当たらない path も) 404 で本文は空。DB にも届かない
+/// 共有 secret が無い・違う・worker 側で取れない ときは、16 口とも (と当たらない path も) 404 で本文は空。DB にも届かない
 #[tokio::test]
 async fn wrong_secret_is_404_everywhere() {
     let a = app().await;
@@ -381,7 +381,8 @@ async fn wrong_secret_is_404_everywhere() {
     let lw = serde_json::to_vec(&lineworks_body(t, &line_id, "x@example.test")).unwrap();
     let line = serde_json::to_vec(&line_body(t, &line_id)).unwrap();
     let reg = serde_json::to_vec(&recipient_body(t, &line_id, "x")).unwrap();
-    let requests: [(&str, String, Option<Vec<u8>>); 14] = [
+    let role_path = format!("/internal/tenants/{t}/users/{}/roles/leave", Uuid::new_v4());
+    let requests: [(&str, String, Option<Vec<u8>>); 17] = [
         ("POST", PATH.to_owned(), Some(create_body)),
         ("GET", format!("{PATH}?tenant_id={t}"), None),
         ("POST", format!("{PATH}/{u}/revoke"), Some(revoke_body)),
@@ -399,6 +400,9 @@ async fn wrong_secret_is_404_everywhere() {
         ),
         ("POST", REGISTER.to_owned(), Some(reg)),
         ("GET", format!("{RECIPIENTS}?line_user_id={line_id}"), None),
+        ("GET", format!("/internal/tenants/{t}/user-roles"), None),
+        ("PUT", role_path.clone(), None),
+        ("DELETE", role_path, None),
         ("GET", "/internal/nothing".to_owned(), None),
     ];
     let no_secret = app_without_secret().await;
@@ -459,12 +463,15 @@ async fn db_failure_is_500() {
         call(&a, "GET", &format!("{USER_BY_LINE}?line_user_id={u}"), None).await,
         call(&a, "POST", REGISTER, Some(recipient_body(t, &u, "x"))).await,
         call(&a, "GET", &format!("{RECIPIENTS}?line_user_id={u}"), None).await,
+        call(&a, "GET", &roles_of(t), None).await,
+        call(&a, "PUT", &role_of(t, Uuid::new_v4(), "leave"), None).await,
+        call(&a, "DELETE", &role_of(t, Uuid::new_v4(), "leave"), None).await,
     ] {
         assert_eq!(got.status, 500);
         assert_eq!(got.json(), json!({"error": "internal_error"}));
     }
     let logs = a.logs.lock().unwrap().clone();
-    assert_eq!(logs.len(), 13, "{logs:?}");
+    assert_eq!(logs.len(), 16, "{logs:?}");
     let whats = [
         "create",
         "list",
@@ -479,6 +486,9 @@ async fn db_failure_is_500() {
         "users/by-line-id",
         "recipients/register-line",
         "recipients/by-line-id",
+        "user-roles",
+        "roles/grant",
+        "roles/revoke",
     ];
     for (log, what) in logs.iter().zip(whats) {
         assert!(log.starts_with(&format!("{what}: ")), "{log}");
@@ -574,6 +584,7 @@ async fn google_invitation_creates_user_with_invited_role() {
             "line_user_id",
             "lineworks_id",
             "name",
+            "permissions",
             "role",
             "slug",
             "tenant_id"
@@ -983,6 +994,7 @@ async fn lineworks_new_is_viewer_then_existing_is_kept() {
             "line_user_id",
             "lineworks_id",
             "name",
+            "permissions",
             "role",
             "slug",
             "tenant_id"
@@ -1240,4 +1252,193 @@ async fn line_inserts_are_bound_by_rls() {
     assert_eq!(line_rows(&id).await, (1, 1));
     assert_eq!(visible(&mut pg, mine, id.clone()).await, 2);
     assert_eq!(visible(&mut pg, other, id.clone()).await, 0);
+}
+
+// ---------- ロールの付け外しの口とログインの permissions ----------
+
+fn roles_of(t: Uuid) -> String {
+    format!("/internal/tenants/{t}/user-roles")
+}
+
+fn role_of(t: impl std::fmt::Display, user: impl std::fmt::Display, role: &str) -> String {
+    format!("/internal/tenants/{t}/users/{user}/roles/{role}")
+}
+
+/// LINE で新しい user を作って返す (viewer)
+async fn line_user(a: &App, t: Uuid) -> Value {
+    let got = call(a, "POST", LINE, Some(line_body(t, &line_user_id()))).await;
+    assert_eq!(got.status, 200);
+    got.json()
+}
+
+async fn grant(a: &App, t: Uuid, user: &Value) -> support::Got {
+    let id = user["id"].as_str().unwrap();
+    call(a, "PUT", &role_of(t, id, "leave"), None).await
+}
+
+async fn role_rows(user: &Value) -> i64 {
+    su_count(&format!(
+        "SELECT count(*) FROM alc_api.user_roles WHERE user_id = '{}'",
+        user["id"].as_str().unwrap()
+    ))
+    .await
+}
+
+/// user を返す 4 口は、付いたロールの権限を `permissions` で返す (無ければ空)。LINE・LINE WORKS・Google の viewer
+#[tokio::test]
+async fn login_returns_permissions_from_roles() {
+    let a = app().await;
+    let t = tenant().await;
+
+    let line = line_user(&a, t).await;
+    assert_eq!(line["permissions"], json!([]));
+    assert_eq!(grant(&a, t, &line).await.status, 204);
+    let id = line["line_user_id"].as_str().unwrap();
+    let again = call(&a, "POST", LINE, Some(line_body(t, id))).await.json();
+    assert_eq!(again["permissions"], json!(["leave.use"]));
+    let by_id = call(
+        &a,
+        "GET",
+        &format!("{USER_BY_LINE}?line_user_id={id}"),
+        None,
+    )
+    .await;
+    assert_eq!(by_id.json()["permissions"], json!(["leave.use"]));
+
+    let lw_id = line_user_id();
+    let lw = lineworks_body(t, &lw_id, "lw@example.test");
+    let created = call(&a, "POST", LINEWORKS, Some(lw.clone())).await.json();
+    assert_eq!(created["permissions"], json!([]));
+    assert_eq!(grant(&a, t, &created).await.status, 204);
+    let again = call(&a, "POST", LINEWORKS, Some(lw)).await.json();
+    assert_eq!(again["permissions"], json!(["leave.use"]));
+
+    let email = format!("v@{}", domain());
+    invite(t, &email, "viewer").await;
+    let sub = gsub();
+    let created = google(&a, &sub, &email).await.json();
+    assert_eq!(created["role"], "viewer");
+    assert_eq!(created["permissions"], json!([]));
+    assert_eq!(grant(&a, t, &created).await.status, 204);
+    let again = google(&a, &sub, &email).await.json();
+    assert_eq!(again["permissions"], json!(["leave.use"]));
+    assert!(a.logs.lock().unwrap().is_empty());
+}
+
+/// admin は全権限 `*` (ロールが付いていても同じ)
+#[tokio::test]
+async fn admin_permissions_are_all() {
+    let a = app().await;
+    let t = tenant().await;
+    let d = domain();
+    set_tenant(t, Some(&d), None).await;
+    let sub = gsub();
+    let email = format!("a@{d}");
+    let created = google(&a, &sub, &email).await.json();
+    assert_eq!(created["role"], "admin");
+    assert_eq!(created["permissions"], json!(["*"]));
+    assert_eq!(
+        grant(&a, t, &created).await.status,
+        204,
+        "admin に付けても拒まない"
+    );
+    assert_eq!(role_rows(&created).await, 1);
+    assert_eq!(
+        google(&a, &sub, &email).await.json()["permissions"],
+        json!(["*"])
+    );
+}
+
+/// 付ける (2 回でも 1 行) → 一覧 (ロールを持つ user だけ) → 外す (無くても 204)
+#[tokio::test]
+async fn roles_put_list_delete() {
+    let a = app().await;
+    let t = tenant().await;
+    let (u1, u2) = (line_user(&a, t).await, line_user(&a, t).await);
+    assert_eq!(call(&a, "GET", &roles_of(t), None).await.json(), json!([]));
+
+    for _ in 0..2 {
+        let got = grant(&a, t, &u1).await;
+        assert_eq!(got.status, 204);
+        assert!(got.body.is_empty());
+    }
+    assert_eq!(role_rows(&u1).await, 1);
+    let got = call(&a, "GET", &roles_of(t), None).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        got.json(),
+        json!([{ "user_id": u1["id"], "roles": ["leave"] }])
+    );
+
+    assert_eq!(grant(&a, t, &u2).await.status, 204);
+    let mut want = vec![
+        json!({ "user_id": u1["id"], "roles": ["leave"] }),
+        json!({ "user_id": u2["id"], "roles": ["leave"] }),
+    ];
+    want.sort_by_key(|v| v["user_id"].as_str().unwrap().to_owned());
+    assert_eq!(
+        call(&a, "GET", &roles_of(t), None).await.json(),
+        json!(want)
+    );
+
+    let path = role_of(t, u1["id"].as_str().unwrap(), "leave");
+    for _ in 0..2 {
+        let got = call(&a, "DELETE", &path, None).await;
+        assert_eq!(got.status, 204);
+        assert!(got.body.is_empty());
+    }
+    assert_eq!(role_rows(&u1).await, 0);
+    assert_eq!(
+        call(&a, "GET", &roles_of(t), None).await.json(),
+        json!([{ "user_id": u2["id"], "roles": ["leave"] }])
+    );
+    // 別の会社の一覧には出ない
+    assert_eq!(
+        call(&a, "GET", &roles_of(tenant().await), None)
+            .await
+            .json(),
+        json!([])
+    );
+    assert!(a.logs.lock().unwrap().is_empty());
+}
+
+/// 未知のロール・UUID でない id は 400、別の会社 / 無い user に付けるのは 404 (行は入らない)。
+/// 別の会社からは外せない
+#[tokio::test]
+async fn roles_errors() {
+    let a = app().await;
+    let (t, other) = (tenant().await, tenant().await);
+    let u = line_user(&a, t).await;
+    let id = u["id"].as_str().unwrap();
+
+    for method in ["PUT", "DELETE"] {
+        for (path, code) in [
+            (role_of(t, id, "admin"), "unknown_role"),
+            (role_of(t, id, "Leave"), "unknown_role"),
+            (role_of("x", id, "leave"), "invalid_id"),
+            (role_of(t, "x", "leave"), "invalid_id"),
+        ] {
+            let got = call(&a, method, &path, None).await;
+            assert_eq!(got.status, 400, "{method} {path}");
+            assert_eq!(got.json(), json!({ "error": code }), "{method} {path}");
+        }
+    }
+    let got = call(&a, "GET", "/internal/tenants/x/user-roles", None).await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({ "error": "invalid_id" }));
+
+    for path in [
+        role_of(other, id, "leave"),
+        role_of(t, Uuid::new_v4(), "leave"),
+    ] {
+        let got = call(&a, "PUT", &path, None).await;
+        assert_eq!(got.status, 404, "{path}");
+        assert_eq!(got.json(), json!({ "error": "user_not_found" }));
+    }
+    assert_eq!(role_rows(&u).await, 0);
+    assert_eq!(grant(&a, t, &u).await.status, 204);
+    let got = call(&a, "DELETE", &role_of(other, id, "leave"), None).await;
+    assert_eq!(got.status, 204);
+    assert_eq!(role_rows(&u).await, 1, "別の会社からは外せない");
+    assert!(a.logs.lock().unwrap().is_empty());
 }

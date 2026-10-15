@@ -18,7 +18,9 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - 口は `/internal/machine-credentials…` の 5 本 (`crates/auth/src/internal.rs`) と、ログインの `/internal/auth/…` の 8 本
   (sso-config・users/upsert-google・refresh-token・users/upsert-lineworks・users/upsert-line・users/by-line-id・
   recipients/register-line・recipients/by-line-id。`crates/auth/src/login.rs`。返す JSON の形は移植元 rust-alc-api と同じ。
-  users/by-line-id の無しは 200 `null`)。
+  users/by-line-id の無しは 200 `null`。user を返す 4 口は `permissions` を足す)、ロールの付け外しの 3 本
+  (`GET /internal/tenants/{tenant_id}/user-roles`・`PUT` / `DELETE /internal/tenants/{tenant_id}/users/{user_id}/roles/{role}`。
+  `crates/auth/src/roles.rs`。ロール → 権限の対応は同じファイルの `ROLE_PERMISSIONS` に固定、admin は `*`)。
   **全部 (と当たらない path) を共有 secret
   (`X-Internal-Shared-Secret`、constant-time 比較) で守り、一致しなければ 404** (本文は空)。tenant は body / query で受ける。
 - **暗号処理を持たない**: パスワードの生成・hash の計算・照合の比較・Google の ID token の検証は auth-worker 側。
