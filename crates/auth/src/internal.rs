@@ -9,7 +9,8 @@
 //! | GET | `/internal/machine-credentials/{username}` | 200 `{tenant_id,purpose,secret_hash,revoked}` / 404 (会社をまたいで照合) |
 //!
 //! ログインの口 (`/internal/auth/…`) は [`crate::login`]、ロールの付け外しの口 (`/internal/tenants/…`) は
-//! [`crate::roles`] に在り、同じ router に載せて同じ layer で守る。
+//! [`crate::roles`]、会社の管理の口 (ユーザー・招待・SSO 設定・参加の申請) は [`crate::admin`] に在り、
+//! 同じ router に載せて同じ layer で守る。
 //!
 //! **全部の口 (と当たらない path) を共有 secret (`X-Internal-Shared-Secret`、constant-time 比較) で守り、
 //! 一致しなければ 404** (口が在ることも見せない。本文は当たらない path と同じ空)。tenant は body / query で受ける
@@ -34,6 +35,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio_postgres::error::SqlState;
 
+use crate::admin::admin_routes;
 use crate::creds::{
     check_create, check_list, check_rotate, valid_username, CreateInput, ListQuery, RevokeInput,
     RotateInput,
@@ -75,6 +77,7 @@ pub fn internal_router(state: InternalState) -> Router {
         .merge(login_routes())
         .merge(role_routes())
         .merge(session_routes())
+        .merge(admin_routes())
         // `layer` は当たらない path (fallback) にも掛かる: secret が無ければ口の有無も分からない
         .layer(middleware::from_fn_with_state(
             state.clone(),

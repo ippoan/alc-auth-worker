@@ -1,4 +1,4 @@
-//! 機械用資格情報の内部口 5 本とログインの内部口 8 本とロールの付け外しの口 3 本を、口から実 DB (RLS が効く `alc_api_app`) まで通すテスト。
+//! 機械用資格情報の内部口 5 本とログインの内部口 8 本とロールの付け外しの口 3 本と会社の管理の口 13 本を、口から実 DB (RLS が効く `alc_api_app`) まで通すテスト。
 //! 接続先は `AUTH_TEST_ADMIN_DATABASE_URL` (未設定なら失敗する。tests/support/mod.rs)。
 
 mod support;
@@ -383,7 +383,12 @@ async fn wrong_secret_is_404_everywhere() {
     let reg = serde_json::to_vec(&recipient_body(t, &line_id, "x")).unwrap();
     let role_path = format!("/internal/tenants/{t}/users/{}/roles/leave", Uuid::new_v4());
     let session_user = Uuid::new_v4();
-    let requests: [(&str, String, Option<Vec<u8>>); 19] = [
+    let inv_body = serde_json::to_vec(&json!({ "email": "x@example.test" })).unwrap();
+    let sso_b = serde_json::to_vec(&sso_body("c", "o", Some("x"))).unwrap();
+    let req_body =
+        serde_json::to_vec(&json!({ "org_slug": "x", "user_id": Uuid::new_v4() })).unwrap();
+    let any = Uuid::new_v4();
+    let requests: [(&str, String, Option<Vec<u8>>); 32] = [
         ("POST", PATH.to_owned(), Some(create_body)),
         ("GET", format!("{PATH}?tenant_id={t}"), None),
         ("POST", format!("{PATH}/{u}/revoke"), Some(revoke_body)),
@@ -406,6 +411,23 @@ async fn wrong_secret_is_404_everywhere() {
         ("DELETE", role_path, None),
         ("GET", format!("/internal/tenants/{t}"), None),
         ("DELETE", refresh_of(t, session_user), None),
+        ("GET", users_of(t), None),
+        ("DELETE", format!("{}/{any}", users_of(t)), None),
+        ("GET", invitations_of(t), None),
+        ("POST", invitations_of(t), Some(inv_body)),
+        ("DELETE", format!("{}/{any}", invitations_of(t)), None),
+        ("GET", format!("/internal/tenants/{t}/sso-configs"), None),
+        ("PUT", sso_of(t, "lineworks"), Some(sso_b)),
+        ("DELETE", sso_of(t, "lineworks"), None),
+        ("GET", "/internal/tenant-by-slug/x".to_owned(), None),
+        (
+            "POST",
+            "/internal/access-requests".to_owned(),
+            Some(req_body),
+        ),
+        ("GET", requests_of(t), None),
+        ("POST", format!("{}/{any}/approve", requests_of(t)), None),
+        ("POST", format!("{}/{any}/decline", requests_of(t)), None),
         ("GET", "/internal/nothing".to_owned(), None),
     ];
     let no_secret = app_without_secret().await;
@@ -432,6 +454,10 @@ async fn wrong_secret_is_404_everywhere() {
     assert_eq!(lookup(&a, &v).await.status, 404);
     assert_eq!(lookup(&a, &u).await.json()["revoked"], false);
     assert_eq!(line_rows(&line_id).await, (0, 0));
+    assert_eq!(
+        call(&a, "GET", &invitations_of(t), None).await.json(),
+        json!({"invitations": []})
+    );
 }
 
 /// DB の失敗は 500 internal_error で、ログは SQLSTATE / 種類の label だけ
@@ -471,12 +497,73 @@ async fn db_failure_is_500() {
         call(&a, "DELETE", &role_of(t, Uuid::new_v4(), "leave"), None).await,
         call(&a, "GET", &format!("/internal/tenants/{t}"), None).await,
         call(&a, "DELETE", &refresh_of(t, Uuid::new_v4()), None).await,
+        call(&a, "GET", &users_of(t), None).await,
+        call(
+            &a,
+            "DELETE",
+            &format!("{}/{}", users_of(t), Uuid::new_v4()),
+            None,
+        )
+        .await,
+        call(&a, "GET", &invitations_of(t), None).await,
+        call(
+            &a,
+            "POST",
+            &invitations_of(t),
+            Some(json!({ "email": "u@example.test" })),
+        )
+        .await,
+        call(
+            &a,
+            "DELETE",
+            &format!("{}/{}", invitations_of(t), Uuid::new_v4()),
+            None,
+        )
+        .await,
+        call(
+            &a,
+            "GET",
+            &format!("/internal/tenants/{t}/sso-configs"),
+            None,
+        )
+        .await,
+        call(
+            &a,
+            "PUT",
+            &sso_of(t, "lineworks"),
+            Some(sso_body("c", "o", Some("x"))),
+        )
+        .await,
+        call(&a, "DELETE", &sso_of(t, "lineworks"), None).await,
+        call(&a, "GET", "/internal/tenant-by-slug/x", None).await,
+        call(
+            &a,
+            "POST",
+            "/internal/access-requests",
+            Some(json!({ "org_slug": "x", "user_id": t })),
+        )
+        .await,
+        call(&a, "GET", &requests_of(t), None).await,
+        call(
+            &a,
+            "POST",
+            &format!("{}/{}/approve", requests_of(t), Uuid::new_v4()),
+            None,
+        )
+        .await,
+        call(
+            &a,
+            "POST",
+            &format!("{}/{}/decline", requests_of(t), Uuid::new_v4()),
+            None,
+        )
+        .await,
     ] {
         assert_eq!(got.status, 500);
         assert_eq!(got.json(), json!({"error": "internal_error"}));
     }
     let logs = a.logs.lock().unwrap().clone();
-    assert_eq!(logs.len(), 18, "{logs:?}");
+    assert_eq!(logs.len(), 31, "{logs:?}");
     let whats = [
         "create",
         "list",
@@ -496,6 +583,19 @@ async fn db_failure_is_500() {
         "roles/revoke",
         "tenants/get",
         "refresh-token/clear",
+        "users/list",
+        "users/delete",
+        "invitations/list",
+        "invitations/create",
+        "invitations/delete",
+        "sso-configs/list",
+        "sso-configs/save",
+        "sso-configs/delete",
+        "tenant-by-slug",
+        "access-requests/create",
+        "access-requests/list",
+        "access-requests/approve",
+        "access-requests/decline",
     ];
     for (log, what) in logs.iter().zip(whats) {
         assert!(log.starts_with(&format!("{what}: ")), "{log}");
@@ -1530,4 +1630,598 @@ async fn refresh_token_delete_clears_only_own_tenant_user() {
         assert_eq!(got.status, 400, "{path}");
         assert_eq!(got.json(), json!({"error": "invalid_id"}));
     }
+}
+
+// ---------- 会社の管理の口 (ユーザー・招待・SSO 設定・参加の申請) ----------
+
+fn users_of(t: impl std::fmt::Display) -> String {
+    format!("/internal/tenants/{t}/users")
+}
+
+fn invitations_of(t: impl std::fmt::Display) -> String {
+    format!("/internal/tenants/{t}/invitations")
+}
+
+fn sso_of(t: impl std::fmt::Display, provider: &str) -> String {
+    format!("/internal/tenants/{t}/sso-configs/{provider}")
+}
+
+fn requests_of(t: impl std::fmt::Display) -> String {
+    format!("/internal/tenants/{t}/access-requests")
+}
+
+fn ids(v: &Value, key: &str) -> Vec<String> {
+    v[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// ユーザーの一覧は自分の会社の user だけを作った順に返し、削除は他社の user を消さない (該当 0 件でも 204)
+#[tokio::test]
+async fn tenant_users_list_and_delete() {
+    let a = app().await;
+    let (t1, t2) = (tenant().await, tenant().await);
+    let u1 = line_user(&a, t1).await;
+    let u2 = line_user(&a, t1).await;
+    let other = line_user(&a, t2).await;
+    let id = |u: &Value| u["id"].as_str().unwrap().to_owned();
+
+    let got = call(&a, "GET", &users_of(t1), None).await;
+    assert_eq!(got.status, 200);
+    let body = got.json();
+    assert_eq!(ids(&body, "users"), vec![id(&u1), id(&u2)]);
+    assert_eq!(
+        keys(&body["users"][0]),
+        ["created_at", "email", "id", "name", "role"]
+    );
+    assert_eq!(body["users"][0]["role"], "viewer");
+
+    // 他社の user は t1 の path では消えない
+    let got = call(
+        &a,
+        "DELETE",
+        &format!("{}/{}", users_of(t1), id(&other)),
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 204);
+    assert_eq!(
+        ids(&call(&a, "GET", &users_of(t2), None).await.json(), "users"),
+        vec![id(&other)]
+    );
+    // 自分の会社の user は消える
+    let got = call(&a, "DELETE", &format!("{}/{}", users_of(t1), id(&u1)), None).await;
+    assert_eq!(got.status, 204);
+    assert!(got.body.is_empty());
+    assert_eq!(
+        ids(&call(&a, "GET", &users_of(t1), None).await.json(), "users"),
+        vec![id(&u2)]
+    );
+    assert!(a.logs.lock().unwrap().is_empty());
+}
+
+/// 招待: 作る (role の省略は admin)・同じ会社の同じ email は role だけ差し替える・他社の招待は 409 で書き換えない・
+/// 削除は他社の招待を消さない
+#[tokio::test]
+async fn invitations_create_update_and_delete() {
+    let a = app().await;
+    let (t1, t2) = (tenant().await, tenant().await);
+    let email = format!("inv@{}", domain());
+
+    let got = call(
+        &a,
+        "POST",
+        &invitations_of(t1),
+        Some(json!({ "email": format!(" {email} ") })),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    let inv = got.json();
+    assert_eq!(
+        keys(&inv),
+        ["created_at", "email", "id", "role", "tenant_id"]
+    );
+    assert_eq!(inv["email"], email);
+    assert_eq!(inv["role"], "admin");
+    assert_eq!(inv["tenant_id"], t1.to_string());
+
+    // 同じ会社・同じ email は role だけ変わる (id は同じ)
+    let got = call(
+        &a,
+        "POST",
+        &invitations_of(t1),
+        Some(json!({ "email": email, "role": "payroll" })),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["id"], inv["id"]);
+    assert_eq!(got.json()["role"], "payroll");
+
+    // 他社の招待済みの email は 409 で、t1 の行は変わらない
+    let got = call(
+        &a,
+        "POST",
+        &invitations_of(t2),
+        Some(json!({ "email": email, "role": "viewer" })),
+    )
+    .await;
+    assert_eq!(got.status, 409);
+    assert_eq!(got.json(), json!({"error": "email_taken"}));
+    let list = call(&a, "GET", &invitations_of(t1), None).await.json();
+    assert_eq!(list["invitations"].as_array().unwrap().len(), 1);
+    assert_eq!(list["invitations"][0]["role"], "payroll");
+    assert_eq!(
+        call(&a, "GET", &invitations_of(t2), None).await.json(),
+        json!({"invitations": []})
+    );
+
+    // 入力の検査
+    for (b, code) in [
+        (json!({ "email": "" }), "invalid_email"),
+        (json!({ "email": "no-at" }), "invalid_email"),
+        (
+            json!({ "email": "x@example.test", "role": "member" }),
+            "invalid_role",
+        ),
+        (json!({ "role": "viewer" }), "invalid_body"),
+    ] {
+        let got = call(&a, "POST", &invitations_of(t1), Some(b.clone())).await;
+        assert_eq!(got.status, 400, "{b}");
+        assert_eq!(got.json(), json!({ "error": code }), "{b}");
+    }
+    // 会社が無ければ 404
+    let got = call(
+        &a,
+        "POST",
+        &invitations_of(Uuid::new_v4()),
+        Some(json!({ "email": format!("x@{}", domain()) })),
+    )
+    .await;
+    assert_eq!(got.status, 404);
+    assert_eq!(got.json(), json!({"error": "tenant_not_found"}));
+
+    // 他社の path では消えない。自分の会社の path で消える
+    let one = format!("{}/{}", invitations_of(t2), inv["id"].as_str().unwrap());
+    assert_eq!(call(&a, "DELETE", &one, None).await.status, 204);
+    assert_eq!(
+        call(&a, "GET", &invitations_of(t1), None).await.json()["invitations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let one = format!("{}/{}", invitations_of(t1), inv["id"].as_str().unwrap());
+    let got = call(&a, "DELETE", &one, None).await;
+    assert_eq!(got.status, 204);
+    assert!(got.body.is_empty());
+    assert_eq!(
+        call(&a, "GET", &invitations_of(t1), None).await.json(),
+        json!({"invitations": []})
+    );
+    assert!(a.logs.lock().unwrap().is_empty());
+}
+
+fn sso_body(client_id: &str, org: &str, secret: Option<&str>) -> Value {
+    json!({
+        "client_id": client_id,
+        "client_secret_encrypted": secret,
+        "external_org_id": org,
+        "woff_id": "woff-1",
+    })
+}
+
+async fn stored_secret(t: Uuid, provider: &str) -> String {
+    support::admin()
+        .await
+        .query_typed(
+            &format!(
+                "SELECT client_secret_encrypted FROM alc_api.sso_provider_configs \
+                 WHERE tenant_id = '{t}' AND provider = '{provider}'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0)
+}
+
+/// SSO 設定: secret 無しの新規は 400、secret 付きで作り、secret 無しの更新は secret を保つ。
+/// 他社と同じ client_id は 409、一覧は暗号文を返さない、削除は無ければ 404
+#[tokio::test]
+async fn sso_configs_save_list_and_delete() {
+    let a = app().await;
+    let (t1, t2) = (tenant().await, tenant().await);
+    let (cid, org) = (
+        format!("cid-{}", Uuid::new_v4()),
+        format!("org-{}", Uuid::new_v4()),
+    );
+
+    let got = call(
+        &a,
+        "PUT",
+        &sso_of(t1, "lineworks"),
+        Some(sso_body(&cid, &org, None)),
+    )
+    .await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({"error": "secret_required"}));
+    let got = call(
+        &a,
+        "PUT",
+        &sso_of(t1, "lineworks"),
+        Some(sso_body(&cid, &org, Some(""))),
+    )
+    .await;
+    assert_eq!(
+        got.json(),
+        json!({"error": "secret_required"}),
+        "空文字は secret 無しと同じ"
+    );
+
+    let got = call(
+        &a,
+        "PUT",
+        &sso_of(t1, "lineworks"),
+        Some(sso_body(&cid, &org, Some("enc-1"))),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    let row = got.json();
+    assert_eq!(
+        keys(&row),
+        [
+            "client_id",
+            "created_at",
+            "enabled",
+            "external_org_id",
+            "provider",
+            "updated_at",
+            "woff_id"
+        ]
+    );
+    assert_eq!(row["enabled"], true);
+    assert_eq!(row["woff_id"], "woff-1");
+    assert_eq!(stored_secret(t1, "lineworks").await, "enc-1");
+
+    // secret 無しの更新: secret は変わらず、ほかの列だけ変わる
+    let mut b = sso_body(&cid, &org, None);
+    b["enabled"] = json!(false);
+    b["woff_id"] = Value::Null;
+    let got = call(&a, "PUT", &sso_of(t1, "lineworks"), Some(b)).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["enabled"], false);
+    assert_eq!(got.json()["woff_id"], Value::Null);
+    assert_eq!(stored_secret(t1, "lineworks").await, "enc-1");
+    // secret 付きの更新は secret も差し替える
+    let got = call(
+        &a,
+        "PUT",
+        &sso_of(t1, "lineworks"),
+        Some(sso_body(&cid, &org, Some("enc-2"))),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(stored_secret(t1, "lineworks").await, "enc-2");
+
+    // 他社が同じ client_id / external_org_id を使うと 409 (付け替えない)
+    for b in [
+        sso_body(&cid, "other-org", Some("x")),
+        sso_body("other-cid", &org, Some("x")),
+    ] {
+        let got = call(&a, "PUT", &sso_of(t2, "lineworks"), Some(b)).await;
+        assert_eq!(got.status, 409);
+        assert_eq!(got.json(), json!({"error": "sso_config_conflict"}));
+    }
+    let list = call(
+        &a,
+        "GET",
+        &format!("/internal/tenants/{t1}/sso-configs"),
+        None,
+    )
+    .await;
+    assert_eq!(list.status, 200);
+    let list = list.json();
+    assert_eq!(list["configs"].as_array().unwrap().len(), 1);
+    assert!(!list.to_string().contains("enc-2"), "暗号文を返さない");
+    assert_eq!(
+        call(
+            &a,
+            "GET",
+            &format!("/internal/tenants/{t2}/sso-configs"),
+            None
+        )
+        .await
+        .json(),
+        json!({"configs": []})
+    );
+    // 形の違う body は 400
+    let got = call(
+        &a,
+        "PUT",
+        &sso_of(t1, "lineworks"),
+        Some(json!({ "client_id": "c" })),
+    )
+    .await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({"error": "invalid_body"}));
+
+    // 他社の path では消えない (404)。自分の会社で消え、2 回目は 404
+    let got = call(&a, "DELETE", &sso_of(t2, "lineworks"), None).await;
+    assert_eq!(got.status, 404);
+    assert_eq!(got.json(), json!({"error": "sso_config_not_found"}));
+    let got = call(&a, "DELETE", &sso_of(t1, "lineworks"), None).await;
+    assert_eq!(got.status, 204);
+    assert!(got.body.is_empty());
+    assert_eq!(
+        call(&a, "DELETE", &sso_of(t1, "lineworks"), None)
+            .await
+            .status,
+        404
+    );
+    assert!(a.logs.lock().unwrap().is_empty());
+}
+
+/// 参加の申請: slug で会社を引き、他社の user が申請し、申請先の会社だけが一覧・承認・却下できる
+#[tokio::test]
+async fn access_requests_flow() {
+    let a = app().await;
+    let (home, target) = (tenant().await, tenant().await);
+    let slug = format!("slug-{}", Uuid::new_v4().simple());
+    set_tenant(target, None, Some(&slug)).await;
+    let name: String = support::admin()
+        .await
+        .query_typed(
+            &format!("SELECT name FROM alc_api.tenants WHERE id = '{target}'"),
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+
+    // slug での引き当て
+    let got = call(&a, "GET", &format!("/internal/tenant-by-slug/{slug}"), None).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        got.json(),
+        json!({ "found": true, "id": target.to_string(), "name": name, "slug": slug })
+    );
+    let got = call(&a, "GET", "/internal/tenant-by-slug/no-such-slug", None).await;
+    assert_eq!(got.status, 404);
+    assert_eq!(got.json(), json!({"error": "tenant_not_found"}));
+
+    // 申請 (申請者は別の会社の user)
+    let applicant = line_user(&a, home).await;
+    let uid = applicant["id"].as_str().unwrap().to_owned();
+    let create = |user: String| json!({ "org_slug": slug, "user_id": user });
+    let got = call(
+        &a,
+        "POST",
+        "/internal/access-requests",
+        Some(create(uid.clone())),
+    )
+    .await;
+    assert_eq!(got.status, 201);
+    let req = got.json();
+    assert_eq!(
+        keys(&req),
+        [
+            "created_at",
+            "id",
+            "org_name",
+            "role",
+            "status",
+            "tenant_id",
+            "user_id"
+        ]
+    );
+    assert_eq!(req["tenant_id"], target.to_string());
+    assert_eq!(req["status"], "pending");
+    assert_eq!(req["role"], "viewer");
+    assert_eq!(req["org_name"], name);
+    let second = call(
+        &a,
+        "POST",
+        "/internal/access-requests",
+        Some(create(uid.clone())),
+    )
+    .await
+    .json();
+
+    // 無い slug・無い user は 404、形の違う body は 400
+    let got = call(
+        &a,
+        "POST",
+        "/internal/access-requests",
+        Some(json!({ "org_slug": "no-such-slug", "user_id": uid })),
+    )
+    .await;
+    assert_eq!(got.json(), json!({"error": "tenant_not_found"}));
+    let got = call(
+        &a,
+        "POST",
+        "/internal/access-requests",
+        Some(create(Uuid::new_v4().to_string())),
+    )
+    .await;
+    assert_eq!(got.status, 404);
+    assert_eq!(got.json(), json!({"error": "user_not_found"}));
+    let got = call(
+        &a,
+        "POST",
+        "/internal/access-requests",
+        Some(json!({ "org_slug": slug, "user_id": "x" })),
+    )
+    .await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({"error": "invalid_body"}));
+
+    // 一覧は申請先の会社だけ (新しい順)。status で絞れる
+    let list = call(&a, "GET", &requests_of(target), None).await;
+    assert_eq!(list.status, 200);
+    let list = list.json();
+    assert_eq!(
+        ids(&list, "requests"),
+        vec![
+            second["id"].as_str().unwrap().to_owned(),
+            req["id"].as_str().unwrap().to_owned()
+        ]
+    );
+    assert!(list["requests"][0].get("org_name").is_none());
+    assert_eq!(
+        call(&a, "GET", &requests_of(home), None).await.json(),
+        json!({"requests": []})
+    );
+
+    let approve =
+        |t: Uuid, id: &Value| format!("{}/{}/approve", requests_of(t), id.as_str().unwrap());
+    let decline =
+        |t: Uuid, id: &Value| format!("{}/{}/decline", requests_of(t), id.as_str().unwrap());
+    // 他社の path・無効な role は通らない
+    let got = call(&a, "POST", &approve(home, &req["id"]), None).await;
+    assert_eq!(got.status, 404);
+    assert_eq!(got.json(), json!({"error": "request_not_found"}));
+    let got = call(
+        &a,
+        "POST",
+        &approve(target, &req["id"]),
+        Some(json!({ "role": "member" })),
+    )
+    .await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({"error": "invalid_role"}));
+    // JSON でない・大きすぎる
+    for raw in [b"{".to_vec(), vec![b' '; 5000]] {
+        let got = call_raw(
+            &a,
+            "POST",
+            &approve(target, &req["id"]),
+            Some(SECRET),
+            Some(raw),
+        )
+        .await;
+        assert_eq!(got.status, 400);
+        assert_eq!(got.json(), json!({"error": "invalid_body"}));
+    }
+    // 承認 (body 無しは viewer、null も同じ) → 2 回目は 404 (pending でない)
+    let got = call_raw(
+        &a,
+        "POST",
+        &approve(target, &req["id"]),
+        Some(SECRET),
+        Some(b"null".to_vec()),
+    )
+    .await;
+    assert_eq!(got.status, 204);
+    assert!(got.body.is_empty());
+    assert_eq!(
+        call(&a, "POST", &approve(target, &req["id"]), None)
+            .await
+            .status,
+        404
+    );
+    // 却下 (他社の path は 404)
+    assert_eq!(
+        call(&a, "POST", &decline(home, &second["id"]), None)
+            .await
+            .status,
+        404
+    );
+    let got = call(&a, "POST", &decline(target, &second["id"]), None).await;
+    assert_eq!(got.status, 204);
+    assert_eq!(
+        call(&a, "POST", &decline(target, &second["id"]), None)
+            .await
+            .status,
+        404
+    );
+
+    let pending = call(
+        &a,
+        "GET",
+        &format!("{}?status=pending", requests_of(target)),
+        None,
+    )
+    .await
+    .json();
+    assert_eq!(pending, json!({"requests": []}));
+    let approved = call(
+        &a,
+        "GET",
+        &format!("{}?status=approved", requests_of(target)),
+        None,
+    )
+    .await
+    .json();
+    assert_eq!(
+        ids(&approved, "requests"),
+        vec![req["id"].as_str().unwrap().to_owned()]
+    );
+    assert_eq!(approved["requests"][0]["role"], "viewer");
+    // role 付きの承認
+    let third = call(&a, "POST", "/internal/access-requests", Some(create(uid)))
+        .await
+        .json();
+    assert_eq!(
+        call(
+            &a,
+            "POST",
+            &approve(target, &third["id"]),
+            Some(json!({ "role": "payroll" }))
+        )
+        .await
+        .status,
+        204
+    );
+    let approved = call(
+        &a,
+        "GET",
+        &format!("{}?status=approved", requests_of(target)),
+        None,
+    )
+    .await
+    .json();
+    assert_eq!(approved["requests"][0]["role"], "payroll");
+    assert!(a.logs.lock().unwrap().is_empty());
+}
+
+/// 会社の管理の口の path の id が UUID でなければ 400 `invalid_id`、query の形が違えば 400 `invalid_query`
+#[tokio::test]
+async fn tenant_admin_bad_ids_are_400() {
+    let a = app().await;
+    let t = tenant().await;
+    let u = Uuid::new_v4();
+    for (method, path) in [
+        ("GET", users_of("x")),
+        ("DELETE", format!("{}/{u}", users_of("x"))),
+        ("DELETE", format!("{}/x", users_of(t))),
+        ("GET", invitations_of("x")),
+        ("POST", invitations_of("x")),
+        ("DELETE", format!("{}/x", invitations_of(t))),
+        ("GET", "/internal/tenants/x/sso-configs".to_owned()),
+        ("PUT", sso_of("x", "lineworks")),
+        ("DELETE", sso_of("x", "lineworks")),
+        ("GET", requests_of("x")),
+        ("POST", format!("{}/x/approve", requests_of(t))),
+        ("POST", format!("{}/{u}/decline", requests_of("x"))),
+    ] {
+        let got = call(&a, method, &path, Some(json!({}))).await;
+        assert_eq!(got.status, 400, "{method} {path}");
+        assert_eq!(
+            got.json(),
+            json!({"error": "invalid_id"}),
+            "{method} {path}"
+        );
+    }
+    let got = call(
+        &a,
+        "GET",
+        &format!("{}?status=a&status=b", requests_of(t)),
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({"error": "invalid_query"}));
 }

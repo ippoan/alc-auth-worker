@@ -24,13 +24,19 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
   staging の me・logout・my-orgs 用の 2 本 (`GET /internal/tenants/{tenant_id}` = 200 `{id,name,slug,short_id}` / 本文つきの 404 `tenant_not_found`、
   `DELETE /internal/tenants/{tenant_id}/users/{user_id}/refresh-token` = 204。`crates/auth/src/session.rs`。auth-worker の staging から呼ぶ予定 = c76。
   tenant・user は path で受け、identity ヘッダは読まない)。
+  会社の管理の 13 本 (`crates/auth/src/admin.rs`。ユーザーの一覧・削除、招待の一覧・作成・削除、SSO 設定の一覧・保存・削除、
+  `GET /internal/tenant-by-slug/{slug}`、参加の申請の作成 `POST /internal/access-requests` と一覧・承認・却下。
+  rust-alc-api の `/api/admin/users*`・`/api/admin/sso/configs`・`/api/access-requests*`・`/api/tenants/by-slug` から移植。
+  Refs ippoan/rust-alc-api#680)。**認可 (管理者か・自分自身を消さないか) は auth-worker**。SSO の client secret は
+  auth-worker が暗号化した文字列を保存するだけで、読み出しの口は返さない。招待は他社が同じ email を招待済みなら 409
+  (移植元は他社の行の role を書き換えうる形だった)。
   **全部 (と当たらない path) を共有 secret
   (`X-Internal-Shared-Secret`、constant-time 比較) で守り、一致しなければ 404** (本文は空)。tenant は body / query で受ける。
 - **暗号処理を持たない**: パスワードの生成・hash の計算・照合の比較・Google の ID token の検証は auth-worker 側。
   ここは受け取った `secret_hash` / refresh token の hash を保存して返すだけ。
 - 会社が決まる前の文は `tenant_tx(Uuid::nil())` の中で SECURITY DEFINER の関数 (`machine_credential_lookup()`・
   `find_user_by_google_sub()`・`find_user_by_lineworks_id()`・`find_user_by_line_user_id()`・`find_invitation_by_email()`・
-  `find_recipient_by_line_user_id()`・`save_user_refresh_token()`・`resolve_sso_config()`) と、
+  `find_recipient_by_line_user_id()`・`save_user_refresh_token()`・`resolve_sso_config()`・`create_access_request()`) と、
   RLS の無い `tenants` の SELECT / INSERT だけ。ほかの文は `tenant_tx(<会社>)` の中で WHERE / VALUES にも tenant_id を明示する。
 - role: Google の新規は招待の role、招待が無ければ admin (email_domain の一致・staging の作成)。LINE・LINE WORKS の新規は
   **viewer 固定**、既存の user は role も会社も変えない。取り違えるとテストが落ちる。
@@ -47,6 +53,6 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/auth/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止 (tests/ の superuser の側も `batch_execute` と `query_typed` だけ)。
 - 応答・ログには固定の語だけ (username・email・hash・secret・生のエラー文を出さない)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 13・api_db 38) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 15・api_db 43) はテストを足したら上げる。
 - public repo: ホスト名・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (ippoan/rust-leave-worker と同じ rev)。

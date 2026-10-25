@@ -722,3 +722,456 @@ pub async fn revoke_role(
     })
     .await
 }
+
+// ---------- 会社の管理 (ユーザー・招待・SSO 設定・参加の申請。rust-alc-api の /api/admin/users・
+// /api/admin/sso/configs・/api/access-requests・/api/tenants/by-slug から移した。Refs ippoan/rust-alc-api#680) ----------
+//
+// 会社の中の文はその会社の transaction で tenant_id を WHERE / VALUES に明示する。会社をまたぐのは slug での
+// 会社の引き当て (RLS の無い tenants) と参加の申請の作成 (SECURITY DEFINER の `create_access_request()`) だけで、
+// nil の tenant の transaction で流す。
+
+pub mod admin_sql {
+    pub const USERS: &str = "SELECT id, email, name, role, created_at FROM alc_api.users \
+         WHERE tenant_id = $1 ORDER BY created_at, id";
+
+    pub const DELETE_USER: &str = "DELETE FROM alc_api.users WHERE id = $1 AND tenant_id = $2";
+
+    pub const INVITATIONS: &str = "SELECT id, tenant_id, email, role, created_at \
+         FROM alc_api.tenant_allowed_emails WHERE tenant_id = $1 ORDER BY created_at, id";
+
+    /// 招待を作る / 同じ会社の同じ email なら role だけ差し替える。email は会社をまたいで一意で、
+    /// **他社の招待に当たったら書き換えずに 0 行** (移植元は他社の行の role を書き換えうる形だった)
+    pub const UPSERT_INVITATION: &str =
+        "INSERT INTO alc_api.tenant_allowed_emails (tenant_id, email, role) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (email) DO UPDATE SET role = EXCLUDED.role \
+         WHERE alc_api.tenant_allowed_emails.tenant_id = EXCLUDED.tenant_id \
+         RETURNING id, tenant_id, email, role, created_at";
+
+    pub const DELETE_INVITATION_BY_ID: &str =
+        "DELETE FROM alc_api.tenant_allowed_emails WHERE id = $1 AND tenant_id = $2";
+
+    /// SSO 設定の一覧 (client_secret_encrypted は返さない)
+    pub const SSO_CONFIGS: &str = "SELECT provider, client_id, external_org_id, enabled, woff_id, \
+         created_at, updated_at FROM alc_api.sso_provider_configs WHERE tenant_id = $1 ORDER BY provider";
+
+    pub const UPSERT_SSO_WITH_SECRET: &str = "INSERT INTO alc_api.sso_provider_configs \
+         (tenant_id, provider, client_id, client_secret_encrypted, external_org_id, woff_id, enabled) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (tenant_id, provider) DO UPDATE SET \
+         client_id = EXCLUDED.client_id, client_secret_encrypted = EXCLUDED.client_secret_encrypted, \
+         external_org_id = EXCLUDED.external_org_id, woff_id = EXCLUDED.woff_id, \
+         enabled = EXCLUDED.enabled, updated_at = NOW() \
+         RETURNING provider, client_id, external_org_id, enabled, woff_id, created_at, updated_at";
+
+    /// secret を渡さない保存は既存の行の更新だけ (client_secret_encrypted は NOT NULL で新規は作れない)
+    pub const UPDATE_SSO_WITHOUT_SECRET: &str = "UPDATE alc_api.sso_provider_configs SET \
+         client_id = $3, external_org_id = $4, woff_id = $5, enabled = $6, updated_at = NOW() \
+         WHERE tenant_id = $1 AND provider = $2 \
+         RETURNING provider, client_id, external_org_id, enabled, woff_id, created_at, updated_at";
+
+    pub const DELETE_SSO: &str =
+        "DELETE FROM alc_api.sso_provider_configs WHERE tenant_id = $1 AND provider = $2";
+
+    /// slug で会社を引く (会社をまたぐ。RLS の無い tenants)
+    pub const TENANT_BY_SLUG: &str = "SELECT id, name, slug FROM alc_api.tenants WHERE slug = $1";
+
+    /// 参加の申請を作る (申請先は申請者の会社でないので SECURITY DEFINER。ippoan/alc-migrations の 158)
+    pub const CREATE_ACCESS_REQUEST: &str =
+        "SELECT id, tenant_id, user_id, status, role, created_at \
+         FROM alc_api.create_access_request($1, $2)";
+
+    /// `$2` が NULL なら全部の status。新しい順
+    pub const ACCESS_REQUESTS: &str = "SELECT id, tenant_id, user_id, status, role, created_at \
+         FROM alc_api.access_requests WHERE tenant_id = $1 AND ($2::text IS NULL OR status = $2) \
+         ORDER BY created_at DESC, id";
+
+    /// pending の申請だけ承認する (0 行 = 無い・他社・pending でない)
+    pub const APPROVE_ACCESS_REQUEST: &str = "UPDATE alc_api.access_requests \
+         SET status = 'approved', role = $1, updated_at = NOW() \
+         WHERE id = $2 AND tenant_id = $3 AND status = 'pending'";
+
+    pub const DECLINE_ACCESS_REQUEST: &str = "UPDATE alc_api.access_requests \
+         SET status = 'declined', updated_at = NOW() \
+         WHERE id = $1 AND tenant_id = $2 AND status = 'pending'";
+}
+
+/// 会社の user の 1 行 (`GET /internal/tenants/{tenant_id}/users`。移植元の `UserResponse` と同じ形)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TenantUser {
+    pub id: Uuid,
+    pub email: String,
+    pub name: String,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 招待の 1 行 (移植元の `TenantAllowedEmail` と同じ形)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TenantInvitation {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub email: String,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// SSO 設定の 1 行 (移植元の `SsoConfigRow` と同じ形。client_secret_encrypted は持たない)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SsoConfigRow {
+    pub provider: String,
+    pub client_id: String,
+    pub external_org_id: String,
+    pub enabled: bool,
+    pub woff_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// SSO 設定の保存の入力 (`client_secret_encrypted` は auth-worker が暗号化したもの。`None` なら既存の行の更新だけ)
+#[derive(Debug, Clone, PartialEq)]
+pub struct SsoConfigInput {
+    pub provider: String,
+    pub client_id: String,
+    pub client_secret_encrypted: Option<String>,
+    pub external_org_id: String,
+    pub woff_id: Option<String>,
+    pub enabled: bool,
+}
+
+/// slug で引いた会社 (移植元の `TenantBySlugResponse` の中身)
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlugTenant {
+    pub id: Uuid,
+    pub name: String,
+    pub slug: Option<String>,
+}
+
+/// 参加の申請の 1 行 (移植元の `AccessRequestResponse` から org_name を除いた形)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccessRequest {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub user_id: Uuid,
+    pub status: String,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TxOutput for TenantUser {}
+impl TxOutput for TenantInvitation {}
+impl TxOutput for SsoConfigRow {}
+impl TxOutput for SlugTenant {}
+impl TxOutput for AccessRequest {}
+
+fn sso_config_row(r: &Row) -> SsoConfigRow {
+    SsoConfigRow {
+        provider: r.get(0),
+        client_id: r.get(1),
+        external_org_id: r.get(2),
+        enabled: r.get(3),
+        woff_id: r.get(4),
+        created_at: r.get(5),
+        updated_at: r.get(6),
+    }
+}
+
+fn invitation_row(r: &Row) -> TenantInvitation {
+    TenantInvitation {
+        id: r.get(0),
+        tenant_id: r.get(1),
+        email: r.get(2),
+        role: r.get(3),
+        created_at: r.get(4),
+    }
+}
+
+fn access_request_row(r: &Row) -> AccessRequest {
+    AccessRequest {
+        id: r.get(0),
+        tenant_id: r.get(1),
+        user_id: r.get(2),
+        status: r.get(3),
+        role: r.get(4),
+        created_at: r.get(5),
+    }
+}
+
+pub async fn tenant_users(pg: &mut PgClient, tenant_id: Uuid) -> Result<Vec<TenantUser>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(admin_sql::USERS, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| TenantUser {
+                    id: r.get(0),
+                    email: r.get(1),
+                    name: r.get(2),
+                    role: r.get(3),
+                    created_at: r.get(4),
+                })
+                .collect())
+        })
+    })
+    .await
+}
+
+/// その会社の user を消す。消えた行数 (無い・他社は 0)
+pub async fn delete_tenant_user(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    user_id: Uuid,
+) -> Result<u64, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                admin_sql::DELETE_USER,
+                &[(&user_id, Type::UUID), (&tenant_id, Type::UUID)],
+            )
+            .await
+        })
+    })
+    .await
+}
+
+pub async fn tenant_invitations(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Vec<TenantInvitation>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(admin_sql::INVITATIONS, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(rows.iter().map(invitation_row).collect())
+        })
+    })
+    .await
+}
+
+/// 招待を作る / 同じ会社の同じ email の role を差し替える。他社が同じ email を招待していれば `None`
+pub async fn upsert_invitation(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    email: String,
+    role: String,
+) -> Result<Option<TenantInvitation>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(
+                    admin_sql::UPSERT_INVITATION,
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&email, Type::TEXT),
+                        (&role, Type::TEXT),
+                    ],
+                )
+                .await?;
+            Ok(row.as_ref().map(invitation_row))
+        })
+    })
+    .await
+}
+
+/// 招待を id で消す。消えた行数 (無い・他社は 0)
+pub async fn delete_invitation_by_id(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+) -> Result<u64, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                admin_sql::DELETE_INVITATION_BY_ID,
+                &[(&id, Type::UUID), (&tenant_id, Type::UUID)],
+            )
+            .await
+        })
+    })
+    .await
+}
+
+pub async fn sso_configs(pg: &mut PgClient, tenant_id: Uuid) -> Result<Vec<SsoConfigRow>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(admin_sql::SSO_CONFIGS, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(rows.iter().map(sso_config_row).collect())
+        })
+    })
+    .await
+}
+
+/// SSO 設定を保存する。secret 無しで既存の行が無ければ `None` (新規には secret が要る)。
+/// 他社と (provider, client_id) / (provider, external_org_id) が当たれば 23505 (呼び手が 409 にする)
+pub async fn save_sso_config(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    c: SsoConfigInput,
+) -> Result<Option<SsoConfigRow>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = match &c.client_secret_encrypted {
+                Some(secret) => Some(
+                    tx.query_typed_one(
+                        admin_sql::UPSERT_SSO_WITH_SECRET,
+                        &[
+                            (&tenant_id, Type::UUID),
+                            (&c.provider, Type::TEXT),
+                            (&c.client_id, Type::TEXT),
+                            (secret, Type::TEXT),
+                            (&c.external_org_id, Type::TEXT),
+                            (&c.woff_id, Type::TEXT),
+                            (&c.enabled, Type::BOOL),
+                        ],
+                    )
+                    .await?,
+                ),
+                None => {
+                    tx.query_typed_opt(
+                        admin_sql::UPDATE_SSO_WITHOUT_SECRET,
+                        &[
+                            (&tenant_id, Type::UUID),
+                            (&c.provider, Type::TEXT),
+                            (&c.client_id, Type::TEXT),
+                            (&c.external_org_id, Type::TEXT),
+                            (&c.woff_id, Type::TEXT),
+                            (&c.enabled, Type::BOOL),
+                        ],
+                    )
+                    .await?
+                }
+            };
+            Ok(row.as_ref().map(sso_config_row))
+        })
+    })
+    .await
+}
+
+/// SSO 設定を消す。消えた行数 (無い・他社は 0)
+pub async fn delete_sso_config(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    provider: String,
+) -> Result<u64, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                admin_sql::DELETE_SSO,
+                &[(&tenant_id, Type::UUID), (&provider, Type::TEXT)],
+            )
+            .await
+        })
+    })
+    .await
+}
+
+/// slug で会社を引く (会社をまたぐので nil の tenant の transaction で)
+pub async fn tenant_by_slug(pg: &mut PgClient, slug: String) -> Result<Option<SlugTenant>, Error> {
+    pg.tenant_tx(Uuid::nil(), move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(admin_sql::TENANT_BY_SLUG, &[(&slug, Type::TEXT)])
+                .await?;
+            Ok(row.map(|r| SlugTenant {
+                id: r.get(0),
+                name: r.get(1),
+                slug: r.get(2),
+            }))
+        })
+    })
+    .await
+}
+
+/// slug の会社への参加の申請を作る。会社が無ければ `None`。申請先は申請者の会社でないので、slug の引き当てと
+/// 作成を 1 つの nil の tenant の transaction で流し、作成は SECURITY DEFINER の関数で行う。
+/// user が無ければ 23503 (呼び手が 404 にする)
+pub async fn create_access_request(
+    pg: &mut PgClient,
+    slug: String,
+    user_id: Uuid,
+) -> Result<Option<(String, AccessRequest)>, Error> {
+    pg.tenant_tx(Uuid::nil(), move |tx| {
+        Box::pin(async move {
+            let Some(tenant) = tx
+                .query_typed_opt(admin_sql::TENANT_BY_SLUG, &[(&slug, Type::TEXT)])
+                .await?
+            else {
+                return Ok(None);
+            };
+            let (tenant_id, name): (Uuid, String) = (tenant.get(0), tenant.get(1));
+            let row = tx
+                .query_typed_one(
+                    admin_sql::CREATE_ACCESS_REQUEST,
+                    &[(&tenant_id, Type::UUID), (&user_id, Type::UUID)],
+                )
+                .await?;
+            Ok(Some((name, access_request_row(&row))))
+        })
+    })
+    .await
+}
+
+pub async fn access_requests(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    status: Option<String>,
+) -> Result<Vec<AccessRequest>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(
+                    admin_sql::ACCESS_REQUESTS,
+                    &[(&tenant_id, Type::UUID), (&status, Type::TEXT)],
+                )
+                .await?;
+            Ok(rows.iter().map(access_request_row).collect())
+        })
+    })
+    .await
+}
+
+/// pending の申請を承認する。変えた行数 (無い・他社・pending でないは 0)
+pub async fn approve_access_request(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+    role: String,
+) -> Result<u64, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                admin_sql::APPROVE_ACCESS_REQUEST,
+                &[
+                    (&role, Type::TEXT),
+                    (&id, Type::UUID),
+                    (&tenant_id, Type::UUID),
+                ],
+            )
+            .await
+        })
+    })
+    .await
+}
+
+/// pending の申請を却下する。変えた行数 (無い・他社・pending でないは 0)
+pub async fn decline_access_request(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+) -> Result<u64, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                admin_sql::DECLINE_ACCESS_REQUEST,
+                &[(&id, Type::UUID), (&tenant_id, Type::UUID)],
+            )
+            .await
+        })
+    })
+    .await
+}
