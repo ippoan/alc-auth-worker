@@ -42,6 +42,7 @@ use crate::creds::{
 };
 use crate::login::login_routes;
 use crate::pg;
+use crate::rls_check::rls_check_routes;
 use crate::roles::role_routes;
 use crate::secret::secret_matches;
 use crate::session::session_routes;
@@ -78,6 +79,7 @@ pub fn internal_router(state: InternalState) -> Router {
         .merge(role_routes())
         .merge(session_routes())
         .merge(admin_routes())
+        .merge(rls_check_routes())
         // `layer` は当たらない path (fallback) にも掛かる: secret が無ければ口の有無も分からない
         .layer(middleware::from_fn_with_state(
             state.clone(),

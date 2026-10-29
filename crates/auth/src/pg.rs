@@ -2,7 +2,7 @@
 //! (`query_typed` 系・`execute_typed`) だけを使う (Hyperdrive 経由では名前付き prepared statement で接続が切れる)。
 //! RLS に加えて、会社の中の文は `tenant_id = <会社>` を WHERE / VALUES に明示する (所有者で繋いだときの備え)。
 
-use alc_worker_db::{PgClient, TxOutput};
+use alc_worker_db::{PgClient, TenantTx, TxOutput};
 use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use serde::Serialize;
@@ -1171,6 +1171,137 @@ pub async fn decline_access_request(
                 &[(&id, Type::UUID), (&tenant_id, Type::UUID)],
             )
             .await
+        })
+    })
+    .await
+}
+
+// ---------- RLS の検査 (`crate::rls_check`。読み取り専用の transaction で、bind する値の無い固定の問い合わせだけ) ----------
+
+pub mod rls_sql {
+    /// 読み取り専用にする。`tenant_tx` の最初の文 (テナントと search_path の set_config) の後でも READ ONLY へは切り替えられる
+    /// (READ WRITE へ戻すことだけが最初の問い合わせの前に限られる)
+    pub const READ_ONLY: &str = "SET TRANSACTION READ ONLY";
+
+    /// 適用履歴の件数と最大 version (alc-migrations 160 の SECURITY DEFINER 関数。
+    /// 実行用ロールは適用履歴の表を直接は読めない)。
+    pub const MIGRATION_STATUS: &str =
+        "SELECT applied, COALESCE(max_version, 0) FROM alc_api.migration_status()";
+
+    /// いまの接続のロールと、実行用ロールの属性。実行用ロールの行が無ければ 0 行 (= 500)。
+    /// 最後の列は、`alc_api` の表の所有者のどれかの資格を実行用ロールが取れるか
+    /// (所有者のロール名は直書きしない)。
+    pub const RUNTIME_ROLE: &str = "\
+SELECT current_user::text, r.rolsuper, r.rolbypassrls, r.rolinherit, \
+       COALESCE(( \
+           SELECT bool_or(pg_has_role(r.oid, c.relowner, 'MEMBER')) \
+             FROM pg_class c \
+            WHERE c.relnamespace = 'alc_api'::regnamespace \
+              AND c.relkind IN ('r', 'p') \
+       ), false) \
+  FROM pg_roles r \
+ WHERE r.rolname = 'alc_api_rt'";
+
+    /// この DB に繋いでいる `alc_api` 系のロールごとの接続数。読む列は `usename` と件数だけ。
+    pub const CONNECTIONS: &str = r#"
+SELECT a.usename::text, count(*)
+  FROM pg_stat_activity a
+ WHERE a.datname = current_database()
+   AND a.usename LIKE 'alc\_api%'
+ GROUP BY a.usename
+ ORDER BY a.usename"#;
+
+    /// 上の接続の中に、`alc_api` の表の所有者であるロールのものが在るか。
+    pub const OWNER_ROLE_CONNECTED: &str = r#"
+SELECT EXISTS (
+    SELECT 1
+      FROM pg_stat_activity a
+     WHERE a.datname = current_database()
+       AND a.usename LIKE 'alc\_api%'
+       AND a.usesysid IN (
+           SELECT c.relowner
+             FROM pg_class c
+            WHERE c.relnamespace = 'alc_api'::regnamespace
+              AND c.relkind IN ('r', 'p')
+       )
+)"#;
+}
+
+/// テナントを設定しない (nil) 読み取り専用の transaction で `f` を流す。RLS の検査が transaction を取るのはここだけ
+pub async fn read_only<T, F>(pg: &mut PgClient, f: F) -> Result<T, Error>
+where
+    T: TxOutput,
+    F: for<'t> FnOnce(&'t TenantTx<'t>) -> BoxFuture<'t, Result<T, Error>> + Send + 'static,
+{
+    pg.tenant_tx(Uuid::nil(), move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(rls_sql::READ_ONLY, &[]).await?;
+            f(tx).await
+        })
+    })
+    .await
+}
+
+/// RLS の検査の問い合わせの結果 (応答の組み立ては `crate::rls_check`)
+#[derive(Debug, Clone, PartialEq)]
+pub struct RlsSnapshot {
+    pub applied: i64,
+    pub max_version: i64,
+    pub current_user: String,
+    pub rolsuper: bool,
+    pub rolbypassrls: bool,
+    pub rolinherit: bool,
+    pub member_of_table_owner: bool,
+    pub connections: Vec<(String, i64)>,
+    pub owner_role_connected: bool,
+    /// 不変条件の違反 (検査の番号・対象・説明)
+    pub violations: Vec<(i32, String, String)>,
+    /// RLS の状態の JSON (`alc_migrations::RLS_STATE_QUERY` の 1 行 1 列)。取れなければ `None`
+    pub state: Option<serde_json::Value>,
+    /// 状態が取れなかったときのエラーの種類 (SQLSTATE か label)
+    pub state_error: Option<String>,
+}
+
+impl TxOutput for RlsSnapshot {}
+
+/// RLS の検査の問い合わせを、読み取り専用の 1 つの transaction で流す。
+/// **状態の問い合わせは最後** (PostgreSQL は transaction の中で文が失敗すると以後の文が全部失敗する。
+/// 状態だけは失敗しても主の結果を返す — 失敗した transaction の COMMIT は ROLLBACK になる)
+pub async fn rls_snapshot(pg: &mut PgClient) -> Result<RlsSnapshot, Error> {
+    read_only(pg, |tx| {
+        Box::pin(async move {
+            let status = tx.query_typed_one(rls_sql::MIGRATION_STATUS, &[]).await?;
+            let role = tx.query_typed_one(rls_sql::RUNTIME_ROLE, &[]).await?;
+            let connections = tx.query_typed(rls_sql::CONNECTIONS, &[]).await?;
+            let owner = tx
+                .query_typed_one(rls_sql::OWNER_ROLE_CONNECTED, &[])
+                .await?;
+            let violations = tx
+                .query_typed(alc_migrations::RLS_INVARIANTS_QUERY, &[])
+                .await?;
+            let state = tx
+                .query_typed_one(alc_migrations::RLS_STATE_QUERY, &[])
+                .await;
+            let state = state
+                .map(|row| row.get(0))
+                .map_err(|e| alc_worker_db::kind(&e));
+            Ok(RlsSnapshot {
+                applied: status.get(0),
+                max_version: status.get(1),
+                current_user: role.get(0),
+                rolsuper: role.get(1),
+                rolbypassrls: role.get(2),
+                rolinherit: role.get(3),
+                member_of_table_owner: role.get(4),
+                connections: connections.iter().map(|r| (r.get(0), r.get(1))).collect(),
+                owner_role_connected: owner.get(0),
+                violations: violations
+                    .iter()
+                    .map(|r| (r.get(0), r.get(1), r.get(2)))
+                    .collect(),
+                state_error: state.as_ref().err().cloned(),
+                state: state.ok(),
+            })
         })
     })
     .await

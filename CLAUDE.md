@@ -24,6 +24,9 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
   staging の me・logout・my-orgs 用の 2 本 (`GET /internal/tenants/{tenant_id}` = 200 `{id,name,slug,short_id}` / 本文つきの 404 `tenant_not_found`、
   `DELETE /internal/tenants/{tenant_id}/users/{user_id}/refresh-token` = 204。`crates/auth/src/session.rs`。auth-worker の staging から呼ぶ予定 = c76。
   tenant・user は path で受け、identity ヘッダは読まない)。
+  RLS の検査の 1 本 (`GET /internal/rls-check`。`crates/auth/src/rls_check.rs`。rust-alc-api から移した。応答の形は同じで、
+  `migrations.binary_*` は直下 `Cargo.toml` の `alc-migrations` の rev。transaction は `pg::read_only` = `tenant_tx(Uuid::nil())` の最初に
+  `SET TRANSACTION READ ONLY`。W9、Refs ippoan/rust-alc-api#680)。
   会社の管理の 13 本 (`crates/auth/src/admin.rs`。ユーザーの一覧・削除、招待の一覧・作成・削除、SSO 設定の一覧・保存・削除、
   `GET /internal/tenant-by-slug/{slug}`、参加の申請の作成 `POST /internal/access-requests` と一覧・承認・却下。
   rust-alc-api の `/api/admin/users*`・`/api/admin/sso/configs`・`/api/access-requests*`・`/api/tenants/by-slug` から移植。
@@ -53,6 +56,6 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/auth/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止 (tests/ の superuser の側も `batch_execute` と `query_typed` だけ)。
 - 応答・ログには固定の語だけ (username・email・hash・secret・生のエラー文を出さない)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 15・api_db 43) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 47・api_db 46) はテストを足したら上げる。
 - public repo: ホスト名・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (ippoan/rust-leave-worker と同じ rev)。
