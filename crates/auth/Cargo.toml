@@ -13,18 +13,20 @@ unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage)'] }
 [dependencies]
 # 出どころは直下の Cargo.toml の [workspace.dependencies] の 1 か所 (ここに git / path を書かない)
 alc-worker-db = { workspace = true }
+# RLS の検査の問い合わせ・期待する状態・migration の一覧 (`rls_check`)
+alc-migrations = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["json", "query"] }
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 型付きの文の型 (`Type`) と `Row`。接続は張らない (wasm 用の feature `js` は直下の worker と alc-worker-db が付ける)
-tokio-postgres = { version = "0.7", default-features = false, features = ["with-chrono-0_4", "with-uuid-1"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
 uuid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 # tests/ の実 DB の接続 (runtime 付き)。dev-dependency なので wasm のビルドには入らない
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
 tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1", features = ["serde", "v4"] }

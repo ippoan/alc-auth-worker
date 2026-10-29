@@ -24,6 +24,10 @@ members = ["crates/auth"]
 [workspace.dependencies]
 alc-core-wasm = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2" }
 alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2", features = ["chrono"] }
+# RLS の検査 (`/internal/rls-check`) が流す問い合わせ・検査の題・期待する状態・埋め込まれた migration の一覧。
+# git 依存・rev 固定で、書くのはここ 1 か所だけ。応答の migrations.binary_* と drift の比べる相手になるので、
+# alc-migrations の main に merge され本番に流した rev に上げる (テストの DB の版 scripts/ALC_MIGRATIONS_REV も同じ rev に揃える)
+alc-migrations = { git = "https://github.com/ippoan/alc-migrations", rev = "5fbff2e0e886a2221e8fa781cefa195daaaf7ecc" }
 
 # 使わない依存は入れない
 [dependencies]

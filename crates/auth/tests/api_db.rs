@@ -2225,3 +2225,101 @@ async fn tenant_admin_bad_ids_are_400() {
     assert_eq!(got.status, 400);
     assert_eq!(got.json(), json!({"error": "invalid_query"}));
 }
+
+// ---------- RLS の検査 `GET /internal/rls-check` (W9。rust-alc-api から移した口) ----------
+
+const RLS_CHECK: &str = "/internal/rls-check";
+
+/// 応答の形は auth-worker の契約 (rust-alc-api と同じ key)。テストは `alc_api_app` で繋ぐので、実行用ロールの判定は
+/// false (= ok も false)。違反 0 件・検査の一覧・状態と食い違いの計算・組み込んだ migration の数が返る
+#[tokio::test]
+async fn rls_check_reports_the_catalog() {
+    let a = app().await;
+    let got = call(&a, "GET", RLS_CHECK, None).await;
+    assert_eq!(got.status, 200);
+    let v = got.json();
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "connections",
+            "drift",
+            "invariants",
+            "migrations",
+            "ok",
+            "owner_role_connected",
+            "runtime_role",
+            "state",
+            "verdicts"
+        ]
+    );
+    assert_eq!(v["runtime_role"]["current_user"], json!("alc_api_app"));
+    assert_eq!(v["runtime_role"]["is_runtime_role"], json!(false));
+    assert_eq!(v["runtime_role"]["rolsuper"], json!(false));
+    assert_eq!(v["verdicts"]["runtime_role"], json!(false));
+    assert_eq!(v["ok"], json!(false));
+    assert_eq!(v["invariants"]["violation_count"], json!(0));
+    assert_eq!(v["verdicts"]["invariants"], json!(true));
+    let checks = v["invariants"]["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), alc_migrations::RLS_INVARIANT_CHECKS.len());
+    let embedded = alc_migrations::MIGRATOR.iter().count() as i64;
+    assert_eq!(v["migrations"]["binary_count"], json!(embedded));
+    assert!(v["state"]["tables"].is_array(), "{}", v["state"]);
+    assert!(v["drift"]["matches_expected"].is_boolean());
+    let mine = v["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["usename"] == json!("alc_api_app"));
+    assert!(mine, "{}", v["connections"]);
+    assert!(a.logs.lock().unwrap().is_empty());
+}
+
+/// 共有 secret が無ければ 404 (本文は空)。DB の失敗は 500 で、ログは種類の label だけ
+#[tokio::test]
+async fn rls_check_needs_the_secret_and_reports_db_failures() {
+    let a = app().await;
+    let got = call_raw(&a, "GET", RLS_CHECK, None, None).await;
+    assert_eq!((got.status, got.body.is_empty()), (404, true));
+
+    let b = broken_app().await;
+    let got = call(&b, "GET", RLS_CHECK, None).await;
+    assert_eq!(got.status, 500);
+    assert_eq!(got.json(), json!({ "error": "internal_error" }));
+    let logs = b.logs.lock().unwrap().clone();
+    assert_eq!(logs.len(), 1);
+    assert!(logs[0].starts_with("rls-check: "), "{logs:?}");
+}
+
+/// 検査の transaction は読み取り専用: 書く文は 25006 (read_only_sql_transaction) で落ち、何も残らない
+#[tokio::test]
+async fn rls_check_transaction_cannot_write() {
+    let mut pg = support::app_client().await;
+    let id = Uuid::new_v4();
+    let err = auth::pg::read_only(&mut pg, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                "INSERT INTO alc_api.tenants (id, name) VALUES ($1, 'rls-check-read-only')",
+                &[(&id, tokio_postgres::types::Type::UUID)],
+            )
+            .await
+        })
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION)
+    );
+    let left = support::admin()
+        .await
+        .query_typed(
+            "SELECT count(*) FROM alc_api.tenants WHERE id = $1",
+            &[(&id, tokio_postgres::types::Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get::<_, i64>(0);
+    assert_eq!(left, 0);
+}

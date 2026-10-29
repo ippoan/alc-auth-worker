@@ -42,3 +42,8 @@ path = "crates/auth/src/session.rs"
 # tests/api_db.rs と単体テストが通す。Refs ippoan/rust-alc-api#680)
 [[files]]
 path = "crates/auth/src/admin.rs"
+
+# RLS の検査の口 (読み取り専用の transaction・応答の組み立て・履歴との食い違い。rust-alc-api から写した単体テストと
+# tests/api_db.rs が通す。W9、Refs ippoan/rust-alc-api#680)
+[[files]]
+path = "crates/auth/src/rls_check.rs"
