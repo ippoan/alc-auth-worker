@@ -129,6 +129,30 @@ async fn list_is_ordered_and_filtered() {
     assert_eq!(usernames(&got.json()), [u1, u2]);
 }
 
+/// fuel-utran (USB アップローダー) も作れて、照合で purpose が返り、purpose で絞れる
+/// (DB の CHECK は alc-migrations 216。Refs yhonda-ohishi/nginx#814)
+#[tokio::test]
+async fn fuel_utran_is_created_and_filtered() {
+    let a = app().await;
+    let t = tenant().await;
+    let (scan, fuel) = (username(), username());
+    assert_eq!(create(&a, &scan, t, "scan").await.status, 201);
+    let mut b = body(&fuel, t, "fuel");
+    b["purpose"] = json!("fuel-utran");
+    let got = call(&a, "POST", PATH, Some(b)).await;
+    assert_eq!(got.status, 201);
+    assert_eq!(lookup(&a, &fuel).await.json()["purpose"], "fuel-utran");
+    let got = call(
+        &a,
+        "GET",
+        &format!("{PATH}?tenant_id={t}&purpose=fuel-utran"),
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(usernames(&got.json()), [fuel]);
+}
+
 /// 失効の 2 回目も 200 で、revoked_at は最初の時刻のまま
 #[tokio::test]
 async fn revoke_twice_keeps_the_first_time() {
@@ -194,6 +218,7 @@ async fn bad_create_body_is_400() {
     let cases = [
         (with("username", json!("mc_XYZ")), "invalid_username"),
         (with("purpose", json!("other")), "invalid_purpose"),
+        (with("purpose", json!("fuel_utran")), "invalid_purpose"),
         (with("label", json!("")), "invalid_label"),
         (with("label", json!("a".repeat(65))), "invalid_label"),
         (with("secret_hash", json!("abc")), "invalid_secret_hash"),
@@ -227,6 +252,10 @@ async fn bad_list_query_is_400() {
             "invalid_tenant_id",
         ),
         (format!("{PATH}?tenant_id={t}&purpose=x"), "invalid_purpose"),
+        (
+            format!("{PATH}?tenant_id={t}&purpose=fuel_utran"),
+            "invalid_purpose",
+        ),
     ] {
         let got = call(&a, "GET", &uri, None).await;
         assert_eq!(got.status, 400, "{uri}");
