@@ -194,6 +194,7 @@ async fn bad_create_body_is_400() {
     let cases = [
         (with("username", json!("mc_XYZ")), "invalid_username"),
         (with("purpose", json!("other")), "invalid_purpose"),
+        (with("purpose", json!("fuel_utran")), "invalid_purpose"),
         (with("label", json!("")), "invalid_label"),
         (with("label", json!("a".repeat(65))), "invalid_label"),
         (with("secret_hash", json!("abc")), "invalid_secret_hash"),
@@ -227,6 +228,10 @@ async fn bad_list_query_is_400() {
             "invalid_tenant_id",
         ),
         (format!("{PATH}?tenant_id={t}&purpose=x"), "invalid_purpose"),
+        (
+            format!("{PATH}?tenant_id={t}&purpose=fuel_utran"),
+            "invalid_purpose",
+        ),
     ] {
         let got = call(&a, "GET", &uri, None).await;
         assert_eq!(got.status, 400, "{uri}");

@@ -7,8 +7,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// 用途の allowlist (DB の CHECK と同じ。足すときは migration と一緒に)
-pub const PURPOSES: &[&str] = &["leave-scan"];
+/// 用途の allowlist (DB の CHECK と同じ。足すときは migration と一緒に)。
+/// fuel-utran: USB アップローダー (Refs yhonda-ohishi/nginx#814)。DB の CHECK は alc-migrations 216
+pub const PURPOSES: &[&str] = &["leave-scan", "fuel-utran"];
 /// label の最大の字数 (DB の `char_length(label) BETWEEN 1 AND 64`)
 pub const LABEL_MAX_CHARS: usize = 64;
 
@@ -159,7 +160,10 @@ mod tests {
     #[test]
     fn purpose_is_allowlisted() {
         assert!(valid_purpose("leave-scan"));
+        assert!(valid_purpose("fuel-utran"));
         assert!(!valid_purpose("Leave-scan"));
+        assert!(!valid_purpose("fuel_utran"));
+        assert!(!valid_purpose("fuel-utran "));
         assert!(!valid_purpose(""));
     }
 
@@ -223,6 +227,10 @@ mod tests {
         assert_eq!(
             q(Some(t), Some("leave-scan")),
             Ok((id, Some("leave-scan".into())))
+        );
+        assert_eq!(
+            q(Some(t), Some("fuel-utran")),
+            Ok((id, Some("fuel-utran".into())))
         );
         assert_eq!(q(Some(t), Some("x")), Err("invalid_purpose"));
         assert_eq!(q(None, None), Err("invalid_tenant_id"));
