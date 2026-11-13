@@ -740,10 +740,15 @@ pub mod admin_sql {
          FROM alc_api.tenant_allowed_emails WHERE tenant_id = $1 ORDER BY created_at, id";
 
     /// 招待を作る / 同じ会社の同じ email なら role だけ差し替える。email は会社をまたいで一意で、
-    /// **他社の招待に当たったら書き換えずに 0 行** (移植元は他社の行の role を書き換えうる形だった)
+    /// **他社の招待に当たったら書き換えずに 0 行** (移植元は他社の行の role を書き換えうる形だった)。
+    /// 他社の行は先に `find_invitation_by_email()` (SECURITY DEFINER) で見て INSERT しない:
+    /// PostgreSQL 17.12 以降は、RLS で見えない他社の行に ON CONFLICT DO UPDATE が当たると、
+    /// DO UPDATE の WHERE で外れる前に USING の違反 (42501) になる (17.10 までは 0 行だった)。
+    /// ON CONFLICT の WHERE は、検査と INSERT の間に他社が同じ email を入れた場合の守り
     pub const UPSERT_INVITATION: &str =
-        "INSERT INTO alc_api.tenant_allowed_emails (tenant_id, email, role) \
-         VALUES ($1, $2, $3) \
+        "WITH other AS (SELECT 1 FROM alc_api.find_invitation_by_email($2) o WHERE o.tenant_id <> $1) \
+         INSERT INTO alc_api.tenant_allowed_emails (tenant_id, email, role) \
+         SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM other) \
          ON CONFLICT (email) DO UPDATE SET role = EXCLUDED.role \
          WHERE alc_api.tenant_allowed_emails.tenant_id = EXCLUDED.tenant_id \
          RETURNING id, tenant_id, email, role, created_at";
