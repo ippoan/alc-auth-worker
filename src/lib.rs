@@ -21,7 +21,11 @@ use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
 use futures_util::lock::Mutex;
 use tower_service::Service;
-use worker::{console_error, event, Context, Env, HttpRequest, Result, WorkerVersionMetadata};
+use worker::js_sys::{Object, Reflect};
+use worker::wasm_bindgen::JsValue;
+use worker::{
+    console_error, event, Context, Env, HttpRequest, Result, SecretStore, WorkerVersionMetadata,
+};
 
 /// 内部口の共有 secret (Secrets Store の binding。`.get()` で実値にする)
 const INTERNAL_SECRET_BINDING: &str = "INTERNAL_SHARED_SECRET";
@@ -29,18 +33,34 @@ const INTERNAL_SECRET_BINDING: &str = "INTERNAL_SHARED_SECRET";
 /// (scripts/check-exposure.sh が検査する)。Hyperdrive の段 (本番) で有効なら全部の口を 500 にする
 const STAGING_MODE_VAR: &str = "STAGING_MODE";
 
-/// 共有 secret の実値。取れなければ `None` (口は全部 404)
+/// 共有 secret の実値。取れなければ `None` (口は全部 404)。
+///
+/// `env.secret_store()` (workers-rs 0.8.7) は binding の JS の constructor 名が `"Fetcher"` と一致しないと Err にする。
+/// その型名の検査を通さず、env から binding を直接取り出す (auth-worker の TS の `resolveSecret` と同じく、
+/// 文字列でも `.get()` を持つものでも受ける)。ログは種類の語と constructor 名だけ (値・長さ・先頭・hash は出さない)
 async fn internal_secret(env: &Env) -> Option<Arc<str>> {
-    // 失敗の種類だけを出す (workers-rs のエラー文は JS の型名などで、secret の値は含まない)。
-    // 値・長さ・先頭・hash は出さない
-    let store = match env.secret_store(INTERNAL_SECRET_BINDING) {
-        Ok(s) => s,
-        Err(e) => {
-            console_error!("auth: secret binding: {e}");
+    let raw = match Reflect::get(env.as_ref(), &JsValue::from_str(INTERNAL_SECRET_BINDING)) {
+        Ok(v) => v,
+        Err(_) => {
+            console_error!("auth: secret binding: reflect failed");
             return None;
         }
     };
-    match store.get().await {
+    if raw.is_undefined() || raw.is_null() {
+        console_error!("auth: secret binding: undefined");
+        return None;
+    }
+    if let Some(s) = raw.as_string() {
+        console_error!("auth: secret binding: string form");
+        if s.is_empty() {
+            console_error!("auth: secret get: empty");
+            return None;
+        }
+        return Some(Arc::from(s));
+    }
+    let ctor = Object::from(raw.clone()).constructor().name();
+    console_error!("auth: secret binding: ctor={ctor}");
+    match SecretStore::from(raw).get().await {
         Ok(Some(v)) if v.is_empty() => {
             console_error!("auth: secret get: empty");
             None
