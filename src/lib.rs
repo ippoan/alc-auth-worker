@@ -31,11 +31,27 @@ const STAGING_MODE_VAR: &str = "STAGING_MODE";
 
 /// 共有 secret の実値。取れなければ `None` (口は全部 404)
 async fn internal_secret(env: &Env) -> Option<Arc<str>> {
-    let store = env.secret_store(INTERNAL_SECRET_BINDING).ok()?;
+    // 失敗の種類だけを出す (workers-rs のエラー文は JS の型名などで、secret の値は含まない)。
+    // 値・長さ・先頭・hash は出さない
+    let store = match env.secret_store(INTERNAL_SECRET_BINDING) {
+        Ok(s) => s,
+        Err(e) => {
+            console_error!("auth: secret binding: {e}");
+            return None;
+        }
+    };
     match store.get().await {
+        Ok(Some(v)) if v.is_empty() => {
+            console_error!("auth: secret get: empty");
+            None
+        }
         Ok(Some(v)) => Some(Arc::from(v)),
-        _ => {
-            console_error!("auth: no {INTERNAL_SECRET_BINDING} value");
+        Ok(None) => {
+            console_error!("auth: secret get: none");
+            None
+        }
+        Err(e) => {
+            console_error!("auth: secret get: {e}");
             None
         }
     }

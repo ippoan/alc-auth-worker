@@ -507,7 +507,8 @@ async fn wrong_secret_is_404_everywhere() {
         .lock()
         .unwrap()
         .iter()
-        .all(|l| l == "internal: unauthorized"));
+        .all(|l| l == "internal: unauthorized (header_missing)"
+            || l == "internal: unauthorized (mismatch)"));
     // 何も変わっていない
     assert_eq!(lookup(&a, &v).await.status, 404);
     assert_eq!(lookup(&a, &u).await.json()["revoked"], false);

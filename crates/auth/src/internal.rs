@@ -25,7 +25,7 @@ use alc_worker_db::PgClient;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -89,16 +89,30 @@ pub fn internal_router(state: InternalState) -> Router {
 }
 
 async fn require_secret(State(state): State<InternalState>, req: Request, next: Next) -> Response {
-    let given = req
-        .headers()
-        .get(SECRET_HEADER)
-        .and_then(|v| v.to_str().ok());
     let expected = state.secret.as_deref().unwrap_or("");
-    if !secret_matches(expected, given) {
-        (state.log)("internal: unauthorized");
+    if let Some(kind) = unauthorized_kind(expected, req.headers().get(SECRET_HEADER)) {
+        (state.log)(&format!("internal: unauthorized ({kind})"));
         return StatusCode::NOT_FOUND.into_response();
     }
     next.run(req).await
+}
+
+/// 共有 secret が一致しない理由の種類 (一致すれば `None`)。照合そのものは [`secret_matches`] (constant-time)。
+/// ログに出すのは種類の語だけ (値・長さ・先頭は出さない)
+fn unauthorized_kind(expected: &str, header: Option<&HeaderValue>) -> Option<&'static str> {
+    let given = header.and_then(|v| v.to_str().ok());
+    if secret_matches(expected, given) {
+        return None;
+    }
+    Some(if expected.is_empty() {
+        "expected_empty"
+    } else if header.is_none() {
+        "header_missing"
+    } else if given.is_none() {
+        "header_not_ascii"
+    } else {
+        "mismatch"
+    })
 }
 
 pub(crate) fn error(status: StatusCode, code: &str) -> Response {
@@ -217,5 +231,42 @@ async fn lookup(State(state): State<InternalState>, Path(username): Path<String>
         Ok(Some(found)) => Json(found).into_response(),
         Ok(None) => not_found(),
         Err(e) => db_error(&state, "lookup", &e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_expected_empty() {
+        let h = HeaderValue::from_static("s3cret");
+        assert_eq!(unauthorized_kind("", Some(&h)), Some("expected_empty"));
+        assert_eq!(unauthorized_kind("", None), Some("expected_empty"));
+    }
+
+    #[test]
+    fn kind_header_missing() {
+        assert_eq!(unauthorized_kind("s3cret", None), Some("header_missing"));
+    }
+
+    #[test]
+    fn kind_header_not_ascii() {
+        let h = HeaderValue::from_bytes(b"s3cr\xe9t").unwrap();
+        assert_eq!(
+            unauthorized_kind("s3cret", Some(&h)),
+            Some("header_not_ascii")
+        );
+    }
+
+    #[test]
+    fn kind_mismatch() {
+        let h = HeaderValue::from_static("other");
+        assert_eq!(unauthorized_kind("s3cret", Some(&h)), Some("mismatch"));
+        let empty = HeaderValue::from_static("");
+        assert_eq!(unauthorized_kind("s3cret", Some(&empty)), Some("mismatch"));
+        // 一致すれば理由は無い
+        let same = HeaderValue::from_static("s3cret");
+        assert_eq!(unauthorized_kind("s3cret", Some(&same)), None);
     }
 }
