@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 /// 用途の allowlist (DB の CHECK と同じ。足すときは migration と一緒に)。
 /// fuel-utran: USB アップローダー (Refs yhonda-ohishi/nginx#814)。DB の CHECK は alc-migrations 216
-pub const PURPOSES: &[&str] = &["leave-scan", "fuel-utran"];
+/// etc-scan: 複合機の ETC 発行明細書スキャン (Refs ohishi-exp/nuxt-dtako-admin#1287)。DB の CHECK は alc-migrations 218
+pub const PURPOSES: &[&str] = &["leave-scan", "fuel-utran", "etc-scan"];
 /// label の最大の字数 (DB の `char_length(label) BETWEEN 1 AND 64`)
 pub const LABEL_MAX_CHARS: usize = 64;
 
@@ -164,6 +165,9 @@ mod tests {
         assert!(!valid_purpose("Leave-scan"));
         assert!(!valid_purpose("fuel_utran"));
         assert!(!valid_purpose("fuel-utran "));
+        assert!(valid_purpose("etc-scan"));
+        assert!(!valid_purpose("etc_scan"));
+        assert!(!valid_purpose("ETC-scan"));
         assert!(!valid_purpose(""));
     }
 
@@ -231,6 +235,10 @@ mod tests {
         assert_eq!(
             q(Some(t), Some("fuel-utran")),
             Ok((id, Some("fuel-utran".into())))
+        );
+        assert_eq!(
+            q(Some(t), Some("etc-scan")),
+            Ok((id, Some("etc-scan".into())))
         );
         assert_eq!(q(Some(t), Some("x")), Err("invalid_purpose"));
         assert_eq!(q(None, None), Err("invalid_tenant_id"));
