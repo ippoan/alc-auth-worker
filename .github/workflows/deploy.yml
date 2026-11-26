@@ -141,6 +141,27 @@ jobs:
           shared-key: auth-worker
           save-if: false
       - run: cargo install -q worker-build@0.8.7 --locked
+      # 配信後の確認が失敗したときの戻し先。取れなければ出さない (戻し先が分からないまま出さない)。
+      # 最後の deployment で 100% を受けている版を 1 つだけ取る (段階配信の途中なら失敗させる)。
+      # JSON には author の email が入るので、ファイルに取り、版 ID 以外は出さない。
+      - name: いまの本番の版 ID を控える
+        id: prev
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          json="$RUNNER_TEMP/deployments.json"
+          if ! npx -y "wrangler@${WRANGLER_VERSION}" deployments list --json >"$json" 2>"$RUNNER_TEMP/deployments.err"; then
+            echo "::error::wrangler deployments list が失敗した (戻し先が分からないので配信しない)"
+            exit 1
+          fi
+          ids=$(jq -r 'sort_by(.created_on) | last | .versions // [] | map(select(.percentage == 100)) | .[].version_id' "$json" 2>/dev/null || true)
+          count=$(printf '%s' "$ids" | grep -c . || true)
+          if [ "$count" != 1 ] || ! printf '%s' "$ids" | grep -qE '^[0-9a-fA-F-]{36}$'; then
+            echo "::error::最後の deployment の 100% の版 ID が 1 つに決まらない (件数 ${count})。配信しない"
+            exit 1
+          fi
+          echo "prev_version=${ids}"
+          echo "prev_version=${ids}" >> "$GITHUB_OUTPUT"
       - name: wrangler deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -160,6 +181,59 @@ jobs:
             echo "::error::本番に workers.dev の URL が付いた (workers_dev = false のはず。直ちに止めること)"
             exit 1
           fi
+      # 本番でだけ壊れる形 (Secrets Store の binding 等。2026-11-26 に内部口が全部 404 になった) を
+      # 配信直後に本番で確かめる。auth-worker の /health/oauth の providers.lineworks は、
+      # alc-auth-worker の内部口 (sso-config) を共有 secret 付きで叩き、通れば ok: true。
+      # overall は他 provider の都合で unknown / degraded (503) になりうるので見ず、HTTP の状態も問わない。
+      # 応答の形は ippoan/auth-worker の src/handlers/health-oauth.ts。
+      # token と本文の全体は出さない (lineworks の項目だけ)。
+      - name: 配信後の確認 (/health/oauth の lineworks)
+        id: health
+        env:
+          JWT: ${{ secrets.HEALTH_OAUTH_JWT }}
+          URL: https://auth.ippoan.org/health/oauth
+        run: |
+          set -u
+          if [ -z "${JWT}" ]; then
+            echo "::error::HEALTH_OAUTH_JWT が無い"
+            exit 1
+          fi
+          sleep 15
+          body="$RUNNER_TEMP/health.json"
+          attempts=4 # 初回 + 再試行 3 回
+          for i in $(seq 1 "$attempts"); do
+            http_code=$(curl -sS -o "$body" -w '%{http_code}' \
+              -H "Authorization: Bearer ${JWT}" --max-time 30 "$URL" || echo "000")
+            lineworks=$(jq -c '.providers.lineworks // null' "$body" 2>/dev/null || echo "null")
+            echo "試行 ${i}/${attempts}: HTTP ${http_code} lineworks=${lineworks}"
+            if [ "$(jq -r '.providers.lineworks.ok == true' "$body" 2>/dev/null || echo false)" = "true" ]; then
+              echo "lineworks ok (alc-auth-worker の内部口を通った)"
+              exit 0
+            fi
+            [ "$i" = "$attempts" ] || sleep 10
+          done
+          echo "::error::配信後の確認が失敗した (providers.lineworks.ok が true にならない)。前の版へ戻す"
+          exit 1
+      - name: 確認が失敗したので前の版へ戻す
+        if: failure() && steps.health.outcome == 'failure'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PREV_VERSION: ${{ steps.prev.outputs.prev_version }}
+        run: |
+          log="$RUNNER_TEMP/rollback.log"
+          status=0
+          npx -y "wrangler@${WRANGLER_VERSION}" rollback "$PREV_VERSION" \
+            --message "post-deploy health check failed" -y >"$log" 2>&1 || status=$?
+          grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
+          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<workers-dev>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          if [ "$status" != 0 ]; then
+            echo "::error::rollback が失敗した (前の版 ${PREV_VERSION} へ手で戻すこと)"
+            exit "$status"
+          fi
+          echo "::error::前の版 ${PREV_VERSION} へ戻した。この版は配信されていない"
+          exit 1
       - name: Report production deploy to ci-dashboard (compat)
         # Refs ippoan/ci-dashboard#520: Release Wave compatibility の backend (識別子 = git SHA)
         uses: ippoan/ci-workflows/.github/actions/report-backend-deploy@main
