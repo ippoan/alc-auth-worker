@@ -35,9 +35,10 @@ const STAGING_MODE_VAR: &str = "STAGING_MODE";
 
 /// 共有 secret の実値。取れなければ `None` (口は全部 404)。
 ///
-/// `env.secret_store()` (workers-rs 0.8.7) は binding の JS の constructor 名が `"Fetcher"` と一致しないと Err にする。
-/// その型名の検査を通さず、env から binding を直接取り出す (auth-worker の TS の `resolveSecret` と同じく、
-/// 文字列でも `.get()` を持つものでも受ける)。ログは種類の語と constructor 名だけ (値・長さ・先頭・hash は出さない)
+/// `env.secret_store()` は使わない: prod の新しい版では binding の constructor 名が `"ServiceStub"` になり、
+/// workers-rs 0.8.7 の `get_binding` の `"Fetcher"` 検査で Err になった (Refs ohishi-exp/nuxt-dtako-admin#1287)。
+/// env から binding を直接取り出し、文字列でも `.get()` を持つものでも受ける (auth-worker の TS の `resolveSecret` と同じ)。
+/// ログは種類の語と constructor 名だけ (値・長さ・先頭・hash は出さない)
 async fn internal_secret(env: &Env) -> Option<Arc<str>> {
     let raw = match Reflect::get(env.as_ref(), &JsValue::from_str(INTERNAL_SECRET_BINDING)) {
         Ok(v) => v,
@@ -51,27 +52,26 @@ async fn internal_secret(env: &Env) -> Option<Arc<str>> {
         return None;
     }
     if let Some(s) = raw.as_string() {
-        console_error!("auth: secret binding: string form");
         if s.is_empty() {
-            console_error!("auth: secret get: empty");
+            console_error!("auth: secret get: empty (string form)");
             return None;
         }
         return Some(Arc::from(s));
     }
-    let ctor = Object::from(raw.clone()).constructor().name();
-    console_error!("auth: secret binding: ctor={ctor}");
-    match SecretStore::from(raw).get().await {
-        Ok(Some(v)) if v.is_empty() => {
-            console_error!("auth: secret get: empty");
+    // 失敗のログにだけ添える (成功のたびには出さない)
+    let ctor = || Object::from(raw.clone()).constructor().name();
+    match SecretStore::from(raw.clone()).get().await {
+        Ok(Some(v)) if !v.is_empty() => Some(Arc::from(v)),
+        Ok(Some(_)) => {
+            console_error!("auth: secret get: empty (ctor={})", ctor());
             None
         }
-        Ok(Some(v)) => Some(Arc::from(v)),
         Ok(None) => {
-            console_error!("auth: secret get: none");
+            console_error!("auth: secret get: none (ctor={})", ctor());
             None
         }
         Err(e) => {
-            console_error!("auth: secret get: {e}");
+            console_error!("auth: secret get: {e} (ctor={})", ctor());
             None
         }
     }
